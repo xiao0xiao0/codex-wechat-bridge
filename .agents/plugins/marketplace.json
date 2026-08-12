@@ -1,0 +1,20 @@
+{
+  "name": "codex-wechat-bridge",
+  "interface": {
+    "displayName": "Codex WeChat Bridge"
+  },
+  "plugins": [
+    {
+      "name": "codex-wechat-bridge",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex-wechat-bridge"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
