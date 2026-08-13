@@ -1,5 +1,7 @@
 # Codex 微信桥接
 
+[![GitHub Stars](https://img.shields.io/github/stars/xiao0xiao0/codex-wechat-bridge?style=social)](https://github.com/xiao0xiao0/codex-wechat-bridge)
+
 在 Windows 上把 Codex 桌面任务连接到微信 ClawBot：任务结束后发送微信通知，也可以从微信引用通知继续原任务、创建新对话或创建保留历史的对话分支。
 
 > 当前稳定版：`0.9.22`。这是社区项目，不是 OpenAI 或腾讯官方产品。
@@ -48,7 +50,7 @@ pwsh -NoProfile -File "$($plugin.FullName)\scripts\Get-WeChatBridgeDoctor.ps1"
 
 扫码绑定后，先在微信中给 ClawBot 发送任意一条消息，让桥接取得当前会话上下文。然后运行诊断脚本，预期看到主监控和完成监控均为“正常”。
 
-完整的分步教程、更新、卸载和排障见 [中文安装教程](docs/安装教程.md)。
+完整的分步教程、更新、卸载和排障见 [中文安装教程](docs/安装教程.md)。本版的功能说明、升级重点和已知限制见 [v0.9.22 中文发布说明](docs/releases/v0.9.22.md)。
 
 ## 微信用法
 
@@ -86,6 +88,10 @@ pwsh -NoProfile -File .\tests\Validate-PublicRelease.ps1
 ```
 
 验证范围包括插件清单、PowerShell 语法、公开包敏感字面量和 marketplace 结构；不会登录微信、发送消息或创建 Codex 任务。
+
+## 支持项目
+
+如果这个项目帮你减少了守在电脑旁等待 Codex 的时间，欢迎前往 [GitHub 仓库](https://github.com/xiao0xiao0/codex-wechat-bridge)，点击右上角的 **Star**。Star 完全自愿，不会解锁额外功能，也不会影响正常使用；它只是帮助更多有相同需求的人发现这个项目。
 
 ## 许可证
 

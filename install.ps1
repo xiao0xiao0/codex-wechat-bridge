@@ -6,6 +6,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repository = 'xiao0xiao0/codex-wechat-bridge'
+$projectUrl = 'https://github.com/xiao0xiao0/codex-wechat-bridge'
 $marketplace = 'codex-wechat-bridge'
 $pluginName = 'codex-wechat-bridge'
 
@@ -42,6 +43,13 @@ if ($EnableRelay) {
     if ($LASTEXITCODE -ne 0) { throw 'Two-way relay opt-in failed.' }
 }
 
+Write-Host ''
+Write-Host 'Codex 微信桥接安装完成。'
+Write-Host '如果它对你有帮助，欢迎自愿前往 GitHub 仓库右上角点击 Star：'
+Write-Host $projectUrl
+Write-Host 'Star 不会解锁功能，也不是使用要求。'
+Write-Host ''
+
 [pscustomobject]@{
     installed = $true
     marketplace = $marketplace
@@ -51,4 +59,5 @@ if ($EnableRelay) {
     configured = [bool]$Configure
     service_started = [bool]$StartNow
     relay_enabled = [bool]$EnableRelay
+    project_url = $projectUrl
 } | ConvertTo-Json -Depth 5

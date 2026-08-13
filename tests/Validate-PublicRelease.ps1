@@ -15,6 +15,22 @@ $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding utf8 | Convert
 if ([string]$manifest.name -ne 'codex-wechat-bridge') { throw 'Unexpected plugin name.' }
 if ([string]$manifest.version -ne '0.9.22') { throw "Unexpected plugin version: $($manifest.version)" }
 
+$releaseNotesPath = Join-Path $repoRoot ("docs\releases\v{0}.md" -f [string]$manifest.version)
+if (-not (Test-Path -LiteralPath $releaseNotesPath -PathType Leaf)) {
+    throw "Chinese release notes are missing for version $($manifest.version): $releaseNotesPath"
+}
+$releaseNotes = Get-Content -LiteralPath $releaseNotesPath -Raw -Encoding utf8
+$rootReadme = Get-Content -LiteralPath (Join-Path $repoRoot 'README.md') -Raw -Encoding utf8
+$installer = Get-Content -LiteralPath (Join-Path $repoRoot 'install.ps1') -Raw -Encoding utf8
+foreach ($document in @($releaseNotes, $rootReadme, $installer)) {
+    if ($document -notmatch 'https://github\.com/xiao0xiao0/codex-wechat-bridge') {
+        throw 'A public user-facing entry is missing the canonical repository URL.'
+    }
+}
+if ($releaseNotes -notmatch '(?i)star' -or $rootReadme -notmatch '(?i)star' -or $installer -notmatch '(?i)star') {
+    throw 'Release notes, README, and installer must keep the voluntary Star guidance.'
+}
+
 $marketplace = Get-Content -LiteralPath $marketplacePath -Raw -Encoding utf8 | ConvertFrom-Json
 if ([string]$marketplace.name -ne 'codex-wechat-bridge') { throw 'Unexpected marketplace name.' }
 $entry = @($marketplace.plugins | Where-Object { [string]$_.name -eq 'codex-wechat-bridge' })
