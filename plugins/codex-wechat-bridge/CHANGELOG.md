@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.9.22 - 2026-08-13
+
+- Fails closed when a newly discovered native fork must be replayed from byte zero but its source rollout is unavailable: only the bridge-recorded new turn id may pass, so inherited lifecycle history cannot be published as fresh WeChat notifications. If the rollout appears before `turn/start` returns that id, the monitor holds the cursor at byte zero and retries instead of losing a fast completion.
+- Preserves normal incremental monitoring for older forks whose source rollout has since disappeared; their saved byte cursor remains authoritative and new turns continue to notify.
+- Records the missing-source condition in rollout monitor state so each affected fork logs one actionable warning instead of repeating the same warning on every appended event.
+
+## 0.9.21 - 2026-08-13
+
+- Rebuilds `/状态` from the union of the current Codex Desktop task catalog, visible rollout files, and the bridge registry instead of listing only tasks previously recorded by the bridge.
+- Uses the latest rollout lifecycle boundary as the authoritative runtime state: `task_started` is running, `task_complete` is completed, and `turn_aborted` is paused. This prevents stale registry rows from remaining falsely `执行中`.
+- Keeps the catalog as a discovery fallback for active tasks whose rollout has not yet been indexed, while the bridge registry supplies prior summaries rather than deciding execution state.
+- Changes the default `/状态` view to list only genuinely running tasks with a count and current commentary. Paused, failed, and completed tasks remain available under `/状态 最近` and `/状态 完整`.
+
 ## 0.9.20 - 2026-08-13
 
 - Sends a `开始处理` acknowledgement after `/新建` and `/分支` actually start a Codex turn, matching existing-task continuation instead of leaving WeChat at `等待执行`.

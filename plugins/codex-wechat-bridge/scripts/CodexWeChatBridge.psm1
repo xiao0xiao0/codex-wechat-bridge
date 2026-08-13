@@ -1,7 +1,7 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:BridgeVersion = '0.9.20'
+$script:BridgeVersion = '0.9.22'
 $script:DefaultBaseUrl = 'https://ilinkai.weixin.qq.com'
 $script:DefaultCdnBaseUrl = 'https://novac2c.cdn.weixin.qq.com/c2c'
 $script:BotAgent = "CodexWeChatBridge/$($script:BridgeVersion)"
@@ -1316,51 +1316,160 @@ function Initialize-CodexThreadRegistryFromActive {
     Update-CodexThreadRegistry -HookEvent $active -State completed -Summary '此前的最近活动 Codex 对话。' | Out-Null
 }
 
+function Get-CodexRolloutRuntimeIndex {
+    $index = @{}
+    $monitor = Read-BridgeJson -Path (Join-Path (Initialize-BridgeState) 'rollout-monitor.json') `
+        -Default $null -AsHashtable
+    if (-not $monitor -or -not $monitor.ContainsKey('files')) { return $index }
+    foreach ($entry in $monitor.files.GetEnumerator()) {
+        $path = [string]$entry.Key
+        $tracking = $entry.Value
+        if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+        $sessionId = if ($tracking -and $tracking.ContainsKey('session_id')) {
+            [string]$tracking.session_id
+        } else {
+            Get-CodexSessionIdFromRolloutPath -Path $path
+        }
+        if ([string]::IsNullOrWhiteSpace($sessionId)) { continue }
+        $key = $sessionId.ToLowerInvariant()
+        $file = Get-Item -LiteralPath $path
+        if ($index.ContainsKey($key) -and
+            [DateTimeOffset]$index[$key].updated_at -ge [DateTimeOffset]$file.LastWriteTimeUtc) { continue }
+        $index[$key] = [pscustomobject]@{
+            session_id = $sessionId
+            path = $path
+            updated_at = ([DateTimeOffset]$file.LastWriteTimeUtc).ToString('o')
+            user_visible = $tracking -and $tracking.ContainsKey('user_visible') -and [bool]$tracking.user_visible
+        }
+    }
+    return $index
+}
+
+function Resolve-CodexTaskRuntimeState {
+    param(
+        [string]$RegisteredState,
+        [string]$CatalogStatusType,
+        [string]$RolloutPath
+    )
+    if (-not [string]::IsNullOrWhiteSpace($RolloutPath) -and
+        (Test-Path -LiteralPath $RolloutPath -PathType Leaf)) {
+        try {
+            $boundary = Get-CodexRolloutLatestBoundary -Path $RolloutPath
+            if ($boundary) {
+                $runtimeState = switch ([string]$boundary.type) {
+                    'task_started' { 'running' }
+                    'turn_aborted' { 'paused' }
+                    default { 'completed' }
+                }
+                return $runtimeState
+            }
+        } catch { }
+    }
+    if ($CatalogStatusType -eq 'active') { return 'running' }
+    if ($CatalogStatusType -eq 'systemError') { return 'failed' }
+    if ($RegisteredState -in @('completed', 'paused', 'failed')) { return $RegisteredState }
+    # A historical registry row can remain `running` after its rollout was
+    # archived or lost. Without a live lifecycle boundary it must not be
+    # presented as an executing task.
+    if ($RegisteredState -eq 'running') { return 'paused' }
+    return 'completed'
+}
+
 function Get-BridgeTasksText {
     param(
         [switch]$IncludeSummary,
         [switch]$IncludeCompleted
     )
     $catalog = $null
-    try { $catalog = Refresh-CodexThreadCatalog } catch { }
-    $records = @(Get-CodexThreadRegistry -Limit $(if ($IncludeCompleted) { 8 } else { 100 }))
-    if ($records.Count -eq 0) {
+    try { $catalog = Refresh-CodexThreadCatalog -Force } catch { }
+    $records = @(Get-CodexThreadRegistry -Limit 200)
+    $rollouts = Get-CodexRolloutRuntimeIndex
+    $candidates = @{}
+
+    foreach ($thread in @(if ($catalog -and (Test-BridgeProperty -Object $catalog -Name 'threads')) { $catalog.threads } else { @() })) {
+        $sessionId = [string]$thread.session_id
+        if ([string]::IsNullOrWhiteSpace($sessionId)) { continue }
+        $key = $sessionId.ToLowerInvariant()
+        $candidates[$key] = [ordered]@{
+            session_id = $sessionId
+            name = [string]$thread.name
+            cwd = [string]$thread.cwd
+            summary = ''
+            registered_state = ''
+            catalog_status_type = [string]$thread.status_type
+            active_flags = @(if (Test-BridgeProperty -Object $thread -Name 'active_flags') { $thread.active_flags } else { @() })
+            updated_at = [string]$thread.updated_at
+        }
+    }
+    foreach ($record in $records) {
+        $sessionId = [string]$record.session_id
+        if ([string]::IsNullOrWhiteSpace($sessionId)) { continue }
+        $key = $sessionId.ToLowerInvariant()
+        if (-not $candidates.ContainsKey($key)) {
+            $candidates[$key] = [ordered]@{
+                session_id = $sessionId; name = [string]$record.name; cwd = [string]$record.cwd
+                summary = ''; registered_state = ''; catalog_status_type = ''; active_flags = @()
+                updated_at = [string]$record.updated_at
+            }
+        }
+        $candidate = $candidates[$key]
+        if ([string]::IsNullOrWhiteSpace([string]$candidate.name)) { $candidate.name = [string]$record.name }
+        if ([string]::IsNullOrWhiteSpace([string]$candidate.cwd)) { $candidate.cwd = [string]$record.cwd }
+        $candidate.summary = [string]$record.summary
+        $candidate.registered_state = [string]$record.state
+        if ([string]::IsNullOrWhiteSpace([string]$candidate.updated_at)) { $candidate.updated_at = [string]$record.updated_at }
+    }
+    foreach ($entry in $rollouts.GetEnumerator()) {
+        if ($candidates.ContainsKey([string]$entry.Key) -or -not [bool]$entry.Value.user_visible) { continue }
+        $metadata = $null
+        try { $metadata = Get-CodexRolloutMetadata -Path ([string]$entry.Value.path) } catch { }
+        $sessionId = [string]$entry.Value.session_id
+        $cwd = if ($metadata) { [string]$metadata.cwd } else { '' }
+        $candidates[[string]$entry.Key] = [ordered]@{
+            session_id = $sessionId
+            name = Get-CodexThreadDisplayName -SessionId $sessionId -Cwd $cwd
+            cwd = $cwd
+            summary = ''
+            registered_state = ''
+            catalog_status_type = ''
+            active_flags = @()
+            updated_at = [string]$entry.Value.updated_at
+        }
+    }
+
+    $resolved = foreach ($candidate in $candidates.Values) {
+        $key = ([string]$candidate.session_id).ToLowerInvariant()
+        $rollout = if ($rollouts.ContainsKey($key)) { $rollouts[$key] } else { $null }
+        $state = Resolve-CodexTaskRuntimeState -RegisteredState ([string]$candidate.registered_state) `
+            -CatalogStatusType ([string]$candidate.catalog_status_type) `
+            -RolloutPath $(if ($rollout) { [string]$rollout.path } else { '' })
+        $updatedAt = if ($rollout) { [string]$rollout.updated_at } else { [string]$candidate.updated_at }
+        [pscustomobject]@{
+            session_id = [string]$candidate.session_id
+            name = if ([string]::IsNullOrWhiteSpace([string]$candidate.name)) {
+                Get-CodexThreadDisplayName -SessionId ([string]$candidate.session_id) -Cwd ([string]$candidate.cwd)
+            } else { [string]$candidate.name }
+            cwd = [string]$candidate.cwd
+            summary = [string]$candidate.summary
+            state = $state
+            active_flags = @($candidate.active_flags)
+            updated_at = $updatedAt
+        }
+    }
+    $resolved = @($resolved | Sort-Object {
+        try { [DateTimeOffset]::Parse([string]$_.updated_at) } catch { [DateTimeOffset]::MinValue }
+    } -Descending)
+    if (-not $IncludeCompleted) {
+        $resolved = @($resolved | Where-Object { [string]$_.state -eq 'running' })
+    } else {
+        $resolved = @($resolved | Select-Object -First 8)
+    }
+    if ($resolved.Count -eq 0 -and $candidates.Count -eq 0) {
         return '尚未记录 Codex 对话。插件升级后运行过的任务会显示在这里。'
     }
-    $lines = @($(if ($IncludeCompleted) { '最近 Codex 对话：' } else { '当前 Codex 对话：' }))
-    foreach ($record in $records) {
-        $catalogThread = @(if ($catalog -and (Test-BridgeProperty -Object $catalog -Name 'threads')) {
-            $catalog.threads | Where-Object { [string]$_.session_id -eq [string]$record.session_id } | Select-Object -First 1
-        })
-        $effectiveState = [string]$record.state
-        $catalogStatusType = ''
-        $catalogActiveFlags = @()
-        if ($catalogThread.Count -gt 0) {
-            $thread = $catalogThread[0]
-            if (Test-BridgeProperty -Object $thread -Name 'status_type') {
-                $catalogStatusType = [string]$thread.status_type
-            } elseif ((Test-BridgeProperty -Object $thread -Name 'status') -and $thread.status -and
-                (Test-BridgeProperty -Object $thread.status -Name 'type')) {
-                $catalogStatusType = [string]$thread.status.type
-            }
-            if (Test-BridgeProperty -Object $thread -Name 'active_flags') {
-                $catalogActiveFlags = @($thread.active_flags | Where-Object {
-                    -not [string]::IsNullOrWhiteSpace([string]$_)
-                })
-            } elseif ((Test-BridgeProperty -Object $thread -Name 'status') -and $thread.status -and
-                (Test-BridgeProperty -Object $thread.status -Name 'activeFlags')) {
-                $catalogActiveFlags = @($thread.status.activeFlags | Where-Object {
-                    -not [string]::IsNullOrWhiteSpace([string]$_)
-                })
-            }
-        }
-        if ($catalogStatusType -eq 'active') {
-            $effectiveState = 'running'
-        } elseif ($catalogStatusType -eq 'systemError') {
-            $effectiveState = 'failed'
-        }
-        if (-not $IncludeCompleted -and $effectiveState -eq 'completed') { continue }
-        $stateText = switch ($effectiveState) {
+    $lines = @($(if ($IncludeCompleted) { '最近 Codex 对话：' } else { "正在执行的 Codex 对话（$($resolved.Count)）：" }))
+    foreach ($record in $resolved) {
+        $stateText = switch ([string]$record.state) {
             'running' { '执行中' }
             'paused' { '已暂停' }
             'failed' { '失败' }
@@ -1370,12 +1479,12 @@ function Get-BridgeTasksText {
             ([string]$record.summary -replace '\s+', ' ').Trim()
         } else { '' }
         if ($summary.Length -gt 70) { $summary = $summary.Substring(0, 70) + '…' }
-        $name = Get-CodexThreadDisplayName -SessionId ([string]$record.session_id) -Cwd ([string]$record.cwd)
-        $line = "[$stateText] $name"
-        if ($catalogActiveFlags.Count -gt 0) {
-            $line += "（$($catalogActiveFlags -join '、')）"
+        $line = "[$stateText] $([string]$record.name)"
+        $activeFlags = @($record.active_flags | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+        if ($activeFlags.Count -gt 0) {
+            $line += "（$($activeFlags -join '、')）"
         }
-        if ($effectiveState -eq 'running') {
+        if ([string]$record.state -eq 'running') {
             $progress = Get-CodexThreadProgressText -SessionId ([string]$record.session_id)
             if (-not [string]::IsNullOrWhiteSpace($progress)) { $line += "`n  进展：$progress" }
             if ($IncludeSummary -and $summary) { $line += "`n  上次结果：$summary" }
@@ -1384,7 +1493,7 @@ function Get-BridgeTasksText {
         }
         $lines += $line
     }
-    if ($lines.Count -eq 1) { $lines += '当前没有正在执行、暂停或失败的 Codex 对话。' }
+    if ($lines.Count -eq 1) { $lines += '当前没有正在执行的 Codex 对话。' }
     if ($IncludeSummary) {
         $lines += '继续原任务和创建分支都必须引用对应通知；/新建无需引用。'
     } elseif ($IncludeCompleted) {
@@ -2049,6 +2158,27 @@ function Test-CodexRelayPendingForThread {
         if ($targetId.Equals($SessionId, [StringComparison]::OrdinalIgnoreCase)) { return $true }
     }
     return $false
+}
+
+function Get-CodexRelayPendingTurnId {
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$SessionId)
+    $inboxPath = Join-Path (Initialize-BridgeState) 'inbox'
+    foreach ($file in @(Get-ChildItem -LiteralPath $inboxPath -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+        $record = Read-BridgeJson -Path $file.FullName -Default $null
+        if (-not $record -or -not (Test-BridgeProperty -Object $record -Name 'relay_state')) { continue }
+        if ([string]$record.relay_state -notin @('relay_running', 'relay_submitted')) { continue }
+        $targetId = if ((Test-BridgeProperty -Object $record -Name 'target_session_id') -and $record.target_session_id) {
+            [string]$record.target_session_id
+        } elseif ((Test-BridgeProperty -Object $record -Name 'created_thread_id') -and $record.created_thread_id) {
+            [string]$record.created_thread_id
+        } else { '' }
+        if (-not $targetId.Equals($SessionId, [StringComparison]::OrdinalIgnoreCase)) { continue }
+        if ((Test-BridgeProperty -Object $record -Name 'codex_turn_id') -and
+            -not [string]::IsNullOrWhiteSpace([string]$record.codex_turn_id)) {
+            return [string]$record.codex_turn_id
+        }
+    }
+    return ''
 }
 
 function Test-BridgeProperty {
@@ -3292,6 +3422,8 @@ function Initialize-CodexRolloutMonitorState {
             cwd = if ($metadata) { [string]$metadata.cwd } else { '' }
             user_visible = $userVisible
             forked_from_id = if ($metadata) { [string]$metadata.forked_from_id } else { '' }
+            fork_replay_from_zero = $false
+            fork_baseline_warning_logged = $false
             offset = [long]$file.Length
             carry = ''
         }
@@ -3361,6 +3493,7 @@ function Invoke-CodexRolloutMonitorScan {
     $staleCompletionsSkipped = 0
     $burstCompletionsSkipped = 0
     $inheritedForkEventsSkipped = 0
+    $missingForkBaselineEventsSkipped = 0
     $forkSourceTurnIds = @{}
     $changed = $false
     foreach ($file in (Get-ChildItem -LiteralPath $sessionsRoot -Recurse -File -Filter 'rollout-*.jsonl' -ErrorAction SilentlyContinue)) {
@@ -3378,6 +3511,9 @@ function Invoke-CodexRolloutMonitorScan {
                 cwd = if ($metadata) { [string]$metadata.cwd } else { '' }
                 user_visible = $metadata -and [bool]$metadata.user_visible
                 forked_from_id = if ($metadata) { [string]$metadata.forked_from_id } else { '' }
+                fork_replay_from_zero = $pendingRelay -and $metadata -and
+                    -not [string]::IsNullOrWhiteSpace([string]$metadata.forked_from_id)
+                fork_baseline_warning_logged = $false
                 offset = if ($pendingRelay) { 0L } else { [long]$file.Length }
                 carry = ''
             }
@@ -3397,6 +3533,14 @@ function Invoke-CodexRolloutMonitorScan {
             $entry.forked_from_id = if ($metadata) { [string]$metadata.forked_from_id } else { '' }
             $changed = $true
         }
+        if (-not $entry.ContainsKey('fork_replay_from_zero')) {
+            $entry.fork_replay_from_zero = $false
+            $changed = $true
+        }
+        if (-not $entry.ContainsKey('fork_baseline_warning_logged')) {
+            $entry.fork_baseline_warning_logged = $false
+            $changed = $true
+        }
         if (-not [bool]$entry.user_visible) {
             $metadata = Get-CodexRolloutMetadata -Path $file.FullName
             if ($metadata -and [bool]$metadata.user_visible) {
@@ -3406,6 +3550,7 @@ function Invoke-CodexRolloutMonitorScan {
                 if (Test-CodexRelayPendingForThread -SessionId $sessionId) {
                     $entry.offset = 0L
                     $entry.carry = ''
+                    $entry.fork_replay_from_zero = -not [string]::IsNullOrWhiteSpace([string]$entry.forked_from_id)
                 }
                 $changed = $true
             }
@@ -3426,6 +3571,33 @@ function Invoke-CodexRolloutMonitorScan {
             continue
         }
         if ([long]$file.Length -le $offset) { continue }
+
+        $pendingRelay = Test-CodexRelayPendingForThread -SessionId $sessionId
+        if ([bool]$entry.fork_replay_from_zero -and -not $pendingRelay) {
+            # The relay can fail (or finish through the direct App Server path)
+            # before the monitor learns the bridge-owned turn id. In that case
+            # there is no safe lifecycle event to select from the copied fork
+            # history. Seal the current file at EOF and resume ordinary
+            # incremental monitoring from the next append.
+            $entry.offset = [long]$file.Length
+            $entry.carry = ''
+            $entry.fork_replay_from_zero = $false
+            $changed = $true
+            continue
+        }
+        $pendingTurnId = if ([bool]$entry.fork_replay_from_zero) {
+            Get-CodexRelayPendingTurnId -SessionId $sessionId
+        } else { '' }
+        if ([bool]$entry.fork_replay_from_zero -and $pendingRelay -and
+            [string]::IsNullOrWhiteSpace($pendingTurnId)) {
+            # thread/start can make the fork rollout visible just before
+            # turn/start returns its id. Keep the zero-replay cursor in place
+            # until the exact bridge-owned turn is known; consuming the file
+            # here would safely suppress history but could also lose the new
+            # completion event on a very fast turn.
+            continue
+        }
+        $sawExpectedReplayTurn = $false
 
         $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
         $stream = [IO.File]::Open($file.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
@@ -3452,13 +3624,26 @@ function Invoke-CodexRolloutMonitorScan {
                             $forkSourceTurnIds[$forkedFromId] = Get-CodexRolloutLifecycleTurnIdSet -ThreadId $forkedFromId
                         } catch {
                             $forkSourceTurnIds[$forkedFromId] = $null
-                            Write-BridgeLog -Level WARN -Message "Could not load source-turn baseline for fork $sessionId from $forkedFromId."
+                            if (-not [bool]$entry.fork_baseline_warning_logged) {
+                                Write-BridgeLog -Level WARN -Message "Could not load source-turn baseline for fork $sessionId from $forkedFromId; the saved rollout cursor and zero-replay guard remain active."
+                                $entry.fork_baseline_warning_logged = $true
+                                $changed = $true
+                            }
                         }
                     }
                     $sourceIds = $forkSourceTurnIds[$forkedFromId]
                     if ($sourceIds -and $sourceIds.Contains([string]$lifecycle.hook_event.turn_id)) {
                         $inheritedForkEventsSkipped++
                         continue
+                    }
+                    if (-not $sourceIds -and [bool]$entry.fork_replay_from_zero) {
+                        $lifecycleTurnId = [string]$lifecycle.hook_event.turn_id
+                        if ([string]::IsNullOrWhiteSpace($pendingTurnId) -or
+                            -not $lifecycleTurnId.Equals($pendingTurnId, [StringComparison]::OrdinalIgnoreCase)) {
+                            $missingForkBaselineEventsSkipped++
+                            continue
+                        }
+                        $sawExpectedReplayTurn = $true
                     }
                 }
                 if ([string]$lifecycle.event_type -eq 'task_started') {
@@ -3518,6 +3703,11 @@ function Invoke-CodexRolloutMonitorScan {
                     $notificationsPublished++
                 }
             }
+            if ([bool]$entry.fork_replay_from_zero -and $sawExpectedReplayTurn -and
+                [string]::IsNullOrEmpty([string]$entry.carry)) {
+                $entry.fork_replay_from_zero = $false
+                $changed = $true
+            }
             $changed = $true
         } finally {
             $stream.Dispose()
@@ -3531,6 +3721,9 @@ function Invoke-CodexRolloutMonitorScan {
     }
     if ($inheritedForkEventsSkipped -gt 0) {
         Write-BridgeLog -Level INFO -Message "Fork guard skipped $inheritedForkEventsSkipped inherited lifecycle event(s)."
+    }
+    if ($missingForkBaselineEventsSkipped -gt 0) {
+        Write-BridgeLog -Level INFO -Message "Fork zero-replay guard skipped $missingForkBaselineEventsSkipped lifecycle event(s) while the source baseline was unavailable."
     }
     if ($changed) { Write-BridgeJsonAtomic -Path $StatePath -Value $state }
 }

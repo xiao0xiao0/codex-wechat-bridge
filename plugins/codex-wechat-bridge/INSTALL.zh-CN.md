@@ -63,3 +63,7 @@ pwsh -NoProfile -File .\plugins\codex-wechat-bridge\scripts\Uninstall-WeChatBrid
 ```
 
 该脚本默认保留本地凭据、队列和日志，避免误删。
+
+## 支持项目
+
+如果这个工具对你有帮助，欢迎前往 [GitHub 仓库](https://github.com/xiao0xiao0/codex-wechat-bridge)，点击右上角的 **Star**。Star 完全自愿，不会解锁功能，也不会影响正常使用。

@@ -11,7 +11,7 @@ This Windows Codex plugin sends task lifecycle notifications to the official WeC
 - Existing-task continuation submits through the Codex desktop composer so the desktop remains the sole writer for that task. It scans all visible Codex windows for up to 30 seconds, selects only the window whose visible task title matches the quoted target, and targets that window's `ProseMirror` input control through Windows UI Automation; if any check fails, nothing is submitted. It requires Windows to be unlocked and the Codex window to be operable, but it cannot create a competing App Server writer.
 - New conversations and branches use the official Codex App Server `thread/start` and `thread/fork` methods. After the first turn is accepted, WeChat receives `开始处理`; the bridge reports success only after that turn finishes and the exact id and name appear in the interactive Codex Desktop task catalog. If the short-lived App Server exits unexpectedly, a durable Chinese paused/failed notification is sent or queued, so the command never remains indefinitely at `等待执行`.
 - Notification failures never block or continue a Codex turn.
-- Completion monitoring never replays an existing or truncated rollout from byte zero. Native conversation forks also suppress every copied lifecycle event whose turn id already belongs to the source task; only genuinely new branch turns can notify. Completion events older than the monitor epoch or freshness window are suppressed, and a per-scan circuit breaker limits unexpected bursts.
+- Completion monitoring never replays an existing or truncated rollout from byte zero. Native conversation forks also suppress every copied lifecycle event whose turn id already belongs to the source task. If that source rollout is unavailable during a bridge-owned zero replay, the monitor fails closed and admits only the exact new turn id recorded by the bridge; normal incremental turns continue from the saved byte cursor. Completion events older than the monitor epoch or freshness window are suppressed, and a per-scan circuit breaker limits unexpected bursts.
 - Logs redact bearer tokens.
 - Duplicate inbound WeChat message IDs are ignored, and daily/worker logs have bounded retention.
 - The scheduled task starts when available and restarts the monitor after unexpected exits.
@@ -43,7 +43,7 @@ Long-press the desired `【已完成】...` notification in WeChat, choose quote
 Other commands:
 
 - `/桥接状态` — bridge and relay status
-- `/状态` — current conversations needing attention, including the latest user-visible progress commentary for running tasks
+- `/状态` — every genuinely running Desktop task, discovered from the live task catalog and verified against its latest rollout lifecycle boundary, including the latest user-visible progress commentary
 - `/状态 最近` — recent conversations by status and name
 - `/状态 完整` — recent conversations with result summaries
 - `/诊断` — monitor, completion watcher, scheduler, Codex, queue, and log diagnosis
