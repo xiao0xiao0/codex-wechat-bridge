@@ -13,7 +13,7 @@ foreach ($path in @($manifestPath, $marketplacePath, (Join-Path $repoRoot 'READM
 
 $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding utf8 | ConvertFrom-Json
 if ([string]$manifest.name -ne 'codex-wechat-bridge') { throw 'Unexpected plugin name.' }
-if ([string]::IsNullOrWhiteSpace([string]$manifest.version)) { throw 'Plugin version is missing.' }
+if ([string]$manifest.version -ne '0.9.22') { throw "Unexpected plugin version: $($manifest.version)" }
 
 $marketplace = Get-Content -LiteralPath $marketplacePath -Raw -Encoding utf8 | ConvertFrom-Json
 if ([string]$marketplace.name -ne 'codex-wechat-bridge') { throw 'Unexpected marketplace name.' }
