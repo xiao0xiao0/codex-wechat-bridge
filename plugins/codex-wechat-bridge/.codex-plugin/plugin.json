@@ -1,7 +1,7 @@
 {
   "name": "codex-wechat-bridge",
-  "version": "0.9.22",
-  "description": "Bridge Codex tasks to WeChat with reliable notifications, quote-authorized continuation, desktop-visible new tasks, branches, and attachments.",
+  "version": "0.9.30",
+  "description": "Bridge Codex tasks to WeChat with reliable notifications, recoverable backlog reset, quote-authorized continuation, desktop-visible new tasks, branches, and attachments.",
   "author": {
     "name": "Hanxi"
   },
@@ -15,7 +15,7 @@
   "interface": {
     "displayName": "Codex WeChat Bridge",
     "shortDescription": "Connect Codex tasks with WeChat ClawBot.",
-    "longDescription": "A local, Windows-native bridge that watches Codex task lifecycle events and connects them to the official WeChat ClawBot transport without requiring OpenClaw. It supports strict quote-authorized continuation, persistent new tasks, conversation branches, attachments, replay guards, diagnostics, and restart recovery.",
+    "longDescription": "A local, Windows-native bridge that watches Codex task lifecycle events and connects them to the official WeChat ClawBot transport without requiring OpenClaw. It supports strict quote-authorized continuation, persistent new tasks, conversation branches, attachments, recoverable backlog reset, replay guards, diagnostics, and restart recovery.",
     "developerName": "Hanxi",
     "category": "Productivity",
     "capabilities": [
@@ -23,6 +23,7 @@
       "Quote-authorized replies",
       "New tasks and conversation branches",
       "Output attachments",
+      "Recoverable backlog reset",
       "Local automation"
     ],
     "defaultPrompt": [

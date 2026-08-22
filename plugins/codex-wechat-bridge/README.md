@@ -1,5 +1,7 @@
 # Codex WeChat Bridge
 
+Current stable version: **0.9.30**. The bridge validates and self-heals a damaged WeChat polling cursor without replaying accumulated historical commands; transient network failures preserve the last healthy cursor.
+
 This Windows Codex plugin sends task lifecycle notifications to the official WeChat ClawBot channel and relays controlled commands without installing OpenClaw. Its primary commands continue a quoted task, create a desktop-visible conversation, and create a full-history branch of a quoted conversation.
 
 ## Security defaults
@@ -10,6 +12,9 @@ This Windows Codex plugin sends task lifecycle notifications to the official WeC
 - Only the QR-authorized WeChat user can execute messages, and only after the relay is explicitly enabled. Continuation and branch messages must quote a bridge-generated lifecycle notification; `/新建 任务内容` is the explicit unquoted creation exception.
 - Existing-task continuation submits through the Codex desktop composer so the desktop remains the sole writer for that task. It scans all visible Codex windows for up to 30 seconds, selects only the window whose visible task title matches the quoted target, and targets that window's `ProseMirror` input control through Windows UI Automation; if any check fails, nothing is submitted. It requires Windows to be unlocked and the Codex window to be operable, but it cannot create a competing App Server writer.
 - New conversations and branches use the official Codex App Server `thread/start` and `thread/fork` methods. After the first turn is accepted, WeChat receives `开始处理`; the bridge reports success only after that turn finishes and the exact id and name appear in the interactive Codex Desktop task catalog. If the short-lived App Server exits unexpectedly, a durable Chinese paused/failed notification is sent or queued, so the command never remains indefinitely at `等待执行`.
+- Long completion summaries are split at paragraph or sentence boundaries into a bounded series of WeChat messages. Each segment repeats the complete `【已完成】task name` header and a part counter, so quoting any segment remains safe and unambiguous; outbox checkpoints prevent already-sent segments from being replayed after a transient failure.
+- Automatic completion attachments use a configurable deliverable allowlist. Office files, PDFs, images, archives, and selected text deliverables remain eligible, while Markdown (`.md`), source code, scripts, configuration, logs, and temporary files (including `.js` and `.py`) are not sent by default.
+- Every eligible attachment has its own durable queue record. A failed CDN upload receives exponential backoff and never blocks later files; the same conversation/path/size is deduplicated across turns, and a newer completion cannot discard an older unsent attachment.
 - Notification failures never block or continue a Codex turn.
 - Completion monitoring never replays an existing or truncated rollout from byte zero. Native conversation forks also suppress every copied lifecycle event whose turn id already belongs to the source task. If that source rollout is unavailable during a bridge-owned zero replay, the monitor fails closed and admits only the exact new turn id recorded by the bridge; normal incremental turns continue from the saved byte cursor. Completion events older than the monitor epoch or freshness window are suppressed, and a per-scan circuit breaker limits unexpected bursts.
 - Logs redact bearer tokens.
@@ -17,6 +22,7 @@ This Windows Codex plugin sends task lifecycle notifications to the official WeC
 - The scheduled task starts when available and restarts the monitor after unexpected exits.
 
 State is stored under `%LOCALAPPDATA%\CodexWeChatBridge` unless `CODEX_WECHAT_BRIDGE_HOME` is set.
+Tencent iLink and CDN requests use a direct connection by default so local system proxies cannot break WeChat TLS. Set `wechat_http_proxy_mode` in `config.json` to `system` or `auto` only when the environment requires it; `CODEX_WECHAT_BRIDGE_HTTP_PROXY_MODE` is the process-level override.
 
 ## Setup
 
@@ -43,10 +49,15 @@ Long-press the desired `【已完成】...` notification in WeChat, choose quote
 Other commands:
 
 - `/桥接状态` — bridge and relay status
+- `/清空` — archive every unsent notification and attachment, advance the completion-monitor watermark, and start delivery from the current moment; no quote required
 - `/状态` — every genuinely running Desktop task, discovered from the live task catalog and verified against its latest rollout lifecycle boundary, including the latest user-visible progress commentary
 - `/状态 最近` — recent conversations by status and name
 - `/状态 完整` — recent conversations with result summaries
 - `/诊断` — monitor, completion watcher, scheduler, Codex, queue, and log diagnosis
+- quoted `/附件` — attachment counts and numbered files for the referenced completion
+- quoted `/附件 重试` — immediately retry that task's waiting or failed attachments
+- quoted `/附件 <序号>` — enqueue one referenced completion attachment by number
+- quoted `/附件 全部` — enqueue eligible files beyond the automatic limit
 - `/在线` — liveness check
 - `/帮助` — command help
 
@@ -58,6 +69,8 @@ Continuation and source-dependent commands must quote a bridge lifecycle notific
 
 The default mode remains `queue_only` until `Enable-WeChatCodexRelay.ps1` is run. Once enabled, quoted completion replies are executable input from the authorized WeChat user. All task execution requires Codex Desktop to be open or launchable and Windows to be unlocked.
 Quoted text resumes the task associated with the referenced notification. `/新建` uses one neutral bridge-owned working directory, rather than inheriting `new-chat` or another saved project; it creates no new project folder. `/分支` uses Codex's native history fork; it is a conversation branch, not a Git branch and not a Git worktree. The older English commands remain compatible aliases. Notifications and `/状态` use task names; opaque task IDs remain internal.
+
+`/清空` is a recoverable backlog reset for long periods of disuse. It writes a cutoff watermark first, moves waiting text and attachment records into the local `cleared` archive, and advances all tracked rollout cursors to their current end. Tasks that are already running keep running, local deliverable files are not deleted, and only terminal events after the cutoff are eligible for delivery. The compatible English alias is `/clear`.
 
 Completion delivery is handled by a dedicated background rollout monitor, so it also covers existing conversations that do not load or trust plugin Hooks. The monitor reads only lifecycle boundaries and the final assistant message, deduplicates by conversation and turn, then registers the conversation as a direct/quoted reply target.
 
@@ -71,7 +84,7 @@ Completion messages use a compact Chinese layout:
 result summary
 ```
 
-Attachment delivery is disabled by default because it uploads local files to Tencent's WeChat CDN. After the user explicitly approves and enables it, the bridge can send up to three existing local output files referenced by the final assistant message. Files are encrypted with AES-128-ECB and sent as `file_item` attachments; the default per-file ceiling is 100 MB. Text delivery and attachment progress are checkpointed separately so retrying an attachment does not duplicate the completion text.
+Attachment delivery is disabled by default because it uploads local files to Tencent's WeChat CDN. After the user explicitly approves and enables it, the bridge automatically queues up to ten existing local output files referenced by the final assistant message. Files are encrypted with AES-128-ECB and sent as `file_item` attachments; the default per-file ceiling is 100 MB. Each file is checkpointed independently, transient CDN/SSL/timeout failures back off from one minute to six hours, and a failed file does not block the rest. Completion text reports recognized, queued, excluded, and over-limit counts near the beginning of the message; a one-time `【附件完成】` summary reports final delivery counts, and the quote-authorized `/附件` commands inspect or retry the exact referenced task.
 
 If WeChat rejects proactive delivery with `ret=-2`, the bridge first attempts a non-executing empty-cursor context refresh. If no reusable context is available, it pauses delivery instead of retrying every poll, keeps the latest completion for each conversation in the outbox, and resumes automatically when the authorized user sends any new WeChat message. Superseded queued turns are preserved under `outbox-superseded/`.
 

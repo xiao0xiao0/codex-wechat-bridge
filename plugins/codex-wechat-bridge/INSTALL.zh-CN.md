@@ -15,13 +15,13 @@ codex plugin marketplace add xiao0xiao0/codex-wechat-bridge
 codex plugin add codex-wechat-bridge@codex-wechat-bridge
 ```
 
-然后从 Codex 插件缓存定位最新版本，依次运行扫码绑定、服务安装和双向执行授权。仓库根目录的 `README.md` 和 `docs/安装教程.md` 提供了可直接复制的完整命令；也可以克隆仓库后在根目录运行：
+也可以克隆或下载仓库后，在仓库根目录运行：
 
 ```powershell
 pwsh -NoProfile -File .\install.ps1 -Configure -StartNow -EnableRelay
 ```
 
-`-Configure` 会打开二维码绑定流程；`-StartNow` 会注册并启动当前 Windows 用户的后台计划任务；`-EnableRelay` 明确开启微信到 Codex 的执行权限。扫码后，先给机器人发送任意一条微信消息，让桥接取得当前会话上下文。
+`-Configure` 会打开二维码绑定流程；`-StartNow` 会注册并启动当前 Windows 用户的后台计划任务；`-EnableRelay` 会明确开启微信到 Codex 的执行权限。扫码后，先给机器人发送任意一条微信消息，让桥接取得当前会话上下文。
 
 ## 微信指令
 
@@ -32,6 +32,10 @@ pwsh -NoProfile -File .\install.ps1 -Configure -StartNow -EnableRelay
 - `/状态`：查看当前执行中、暂停或失败的任务；执行中任务同时显示最近一条用户可见的阶段性进展。
 - `/状态 最近`：查看最近任务的状态和名称。
 - `/状态 完整`：查看最近任务及结果摘要。
+
+全局维护命令也无需引用：
+
+- `/清空`：把尚未发送的文字通知和附件移入本地可恢复归档，并把完成监控推进到当前时刻；之后只发送新完成内容。它不会停止正在执行的 Codex 任务，也不会删除本地交付文件。兼容英文命令 `/clear`。
 - `/诊断`：诊断后台服务、Codex、PowerShell 和积压。
 - `/帮助`：显示帮助。
 
@@ -39,6 +43,10 @@ pwsh -NoProfile -File .\install.ps1 -Configure -StartNow -EnableRelay
 
 - 直接输入内容：继续被引用的任务。
 - `/分支 [任务内容]`：复制被引用任务已保存的完整对话历史，创建新的桌面任务；这不是 Git 分支。
+- `/附件`：查看被引用任务的附件识别、等待、成功和失败数量，以及附件序号。
+- `/附件 重试`：立即重试被引用任务尚未成功的附件。
+- `/附件 <序号>`：发送被引用任务的指定附件。
+- `/附件 全部`：把超过自动上限但仍符合格式和大小限制的附件加入队列。
 
 `/新建 任务内容` 无需引用：它创建独立桌面任务，不复制旧对话，不继承 `new-chat` 或其他已保存项目，也不创建新项目目录。
 
@@ -51,10 +59,16 @@ pwsh -NoProfile -File .\install.ps1 -Configure -StartNow -EnableRelay
 - `/新建` 不创建新项目目录；Codex 仍要求每个本地任务记录内部工作目录，插件为此使用一个中性专用目录。
 - 所有执行命令都不会自动同意权限审批或交互式提问；需要用户确认时会在桌面任务中等待。
 - 附件发送会把选定本地文件上传到微信 CDN，默认关闭，需使用者明确开启。
+- 完成结果较长时会按段落或句子拆成多条微信消息，并显示 `（1/3）` 等序号；每一段都保留完整的 `【已完成】对话名称`，因此引用任意一段都能继续同一任务。为避免异常长输出刷屏，默认最多发送 6 段，超出部分以省略号结束。
+- 开启附件自动发送后，默认最多自动加入 10 个适合作为交付成果的 Office、PDF、图片、压缩包和部分文本文件；`.md`、`.js`、`.py` 等 Markdown/源码文件，以及配置、日志和临时文件不会发送。
+- 每个附件独立排队；一个文件上传失败不会拦住其他文件。HTTP 500、SSL、超时等临时故障会按 1 分钟、5 分钟、15 分钟、1 小时、3 小时、6 小时退避重试，同一对话中相同路径和大小的文件不会重复发送。
+- 很久未使用后不希望补发历史积压时，先给机器人发送 `/清空`。桥接会先写入时间水位，再归档积压，因此服务重启或完成监控恢复后也不会重新发送清空前的历史内容。
+- 本轮附件全部处理结束后，会发送一次 `【附件完成】` 汇总，列出成功、重复和失败数量。
+- 微信接口默认绕过 Windows 系统代理直接连接，避免本机代理软件中断腾讯 iLink/CDN 的 TLS。确实必须走代理时，可把 `%LOCALAPPDATA%\CodexWeChatBridge\config.json` 中的 `wechat_http_proxy_mode` 改为 `system`；`auto` 表示仅在系统解析到真实代理时使用代理。
 
 ## 更新与卸载
 
-更新时运行 `codex plugin marketplace upgrade codex-wechat-bridge`，重新安装插件，再从新缓存目录运行 `Install-WeChatBridgeService.ps1 -StartNow`。插件状态和微信登录信息会保留。
+更新时运行 `codex plugin marketplace upgrade codex-wechat-bridge`，重新安装插件，再从最新缓存目录运行 `Install-WeChatBridgeService.ps1 -StartNow`。插件状态和微信登录信息会保留。
 
 停止并卸载后台计划任务：
 
@@ -63,7 +77,3 @@ pwsh -NoProfile -File .\plugins\codex-wechat-bridge\scripts\Uninstall-WeChatBrid
 ```
 
 该脚本默认保留本地凭据、队列和日志，避免误删。
-
-## 支持项目
-
-如果这个工具对你有帮助，欢迎前往 [GitHub 仓库](https://github.com/xiao0xiao0/codex-wechat-bridge)，点击右上角的 **Star**。Star 完全自愿，不会解锁功能，也不会影响正常使用。

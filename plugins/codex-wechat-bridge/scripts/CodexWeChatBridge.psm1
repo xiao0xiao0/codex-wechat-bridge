@@ -1,13 +1,58 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:BridgeVersion = '0.9.22'
+$script:BridgeVersion = '0.9.30'
 $script:DefaultBaseUrl = 'https://ilinkai.weixin.qq.com'
 $script:DefaultCdnBaseUrl = 'https://novac2c.cdn.weixin.qq.com/c2c'
 $script:BotAgent = "CodexWeChatBridge/$($script:BridgeVersion)"
 $script:IlinkAppId = 'bot'
 $script:IlinkClientVersion = 256
-$script:HttpClient = [System.Net.Http.HttpClient]::new()
+$script:HttpClientHandler = [System.Net.Http.HttpClientHandler]::new()
+$requestedProxyMode = ([string]$env:CODEX_WECHAT_BRIDGE_HTTP_PROXY_MODE).Trim().ToLowerInvariant()
+if (-not $requestedProxyMode) {
+    try {
+        $earlyStateRoot = if ($env:CODEX_WECHAT_BRIDGE_HOME) {
+            [System.IO.Path]::GetFullPath($env:CODEX_WECHAT_BRIDGE_HOME)
+        } else {
+            Join-Path $env:LOCALAPPDATA 'CodexWeChatBridge'
+        }
+        $earlyConfigPath = Join-Path $earlyStateRoot 'config.json'
+        if (Test-Path -LiteralPath $earlyConfigPath -PathType Leaf) {
+            $earlyConfig = [System.IO.File]::ReadAllText($earlyConfigPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+            if ($earlyConfig.PSObject.Properties.Name -contains 'wechat_http_proxy_mode') {
+                $requestedProxyMode = ([string]$earlyConfig.wechat_http_proxy_mode).Trim().ToLowerInvariant()
+            }
+        }
+    } catch { }
+}
+if ($requestedProxyMode -notin @('direct', 'system', 'auto')) { $requestedProxyMode = 'direct' }
+
+switch ($requestedProxyMode) {
+    'system' {
+        $script:HttpTransportMode = 'system_proxy'
+    }
+    'auto' {
+        $script:HttpTransportMode = 'system_proxy'
+        try {
+            $proxyProbeUri = [Uri]$script:DefaultBaseUrl
+            $defaultProxy = [System.Net.Http.HttpClient]::DefaultProxy
+            $resolvedProxyUri = $defaultProxy.GetProxy($proxyProbeUri)
+            if ($null -eq $resolvedProxyUri -or
+                $defaultProxy.IsBypassed($proxyProbeUri) -or
+                $resolvedProxyUri.AbsoluteUri -eq $proxyProbeUri.AbsoluteUri) {
+                $script:HttpClientHandler.UseProxy = $false
+                $script:HttpTransportMode = 'direct'
+            }
+        } catch {
+            # Preserve the framework default if proxy discovery is unavailable.
+        }
+    }
+    default {
+        $script:HttpClientHandler.UseProxy = $false
+        $script:HttpTransportMode = 'direct'
+    }
+}
+$script:HttpClient = [System.Net.Http.HttpClient]::new($script:HttpClientHandler, $true)
 $script:HttpClient.Timeout = [System.Threading.Timeout]::InfiniteTimeSpan
 
 function Get-BridgeDefaultConfig {
@@ -15,6 +60,7 @@ function Get-BridgeDefaultConfig {
         bridge_version = $script:BridgeVersion
         base_url = $script:DefaultBaseUrl
         cdn_base_url = $script:DefaultCdnBaseUrl
+        wechat_http_proxy_mode = 'direct'
         bot_agent = $script:BotAgent
         account_id = $null
         scanner_user_id = $null
@@ -26,6 +72,8 @@ function Get-BridgeDefaultConfig {
         require_completion_quote = $true
         default_new_thread_cwd = $null
         notify_summary_chars = 700
+        completion_text_chunk_chars = 1100
+        completion_text_max_chunks = 6
         relay_command_prefix = '/codex'
         relay_max_input_chars = 4000
         relay_max_reply_chars = 1800
@@ -42,8 +90,16 @@ function Get-BridgeDefaultConfig {
         context_retry_cooldown_seconds = 300
         outbox_send_batch_size = 4
         completion_attachments_enabled = $false
-        completion_attachment_max_files = 3
+        completion_attachment_max_files = 10
         completion_attachment_max_bytes = 104857600
+        completion_attachment_send_batch_size = 3
+        completion_attachment_retry_delays_seconds = @(60, 300, 900, 3600, 10800, 21600)
+        completion_attachment_allowed_extensions = @(
+            '.doc', '.docx', '.pdf', '.ppt', '.pptx', '.xls', '.xlsx',
+            '.csv', '.txt', '.rtf',
+            '.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg',
+            '.zip', '.7z', '.rar'
+        )
         log_retention_days = 14
         worker_log_retention_days = 7
         inbound_history_limit = 1000
@@ -61,7 +117,10 @@ function Get-BridgeStateRoot {
 
 function Initialize-BridgeState {
     $root = Get-BridgeStateRoot
-    foreach ($name in @('', 'outbox', 'outbox-superseded', 'inbox', 'logs', 'threads', 'worktrees')) {
+    foreach ($name in @(
+        '', 'outbox', 'outbox-superseded', 'attachment-outbox', 'attachment-catalog',
+        'attachment-sent', 'attachment-failed', 'attachment-skipped', 'cleared', 'inbox', 'logs', 'threads', 'worktrees'
+    )) {
         $path = if ($name) { Join-Path $root $name } else { $root }
         [System.IO.Directory]::CreateDirectory($path) | Out-Null
     }
@@ -101,6 +160,295 @@ function Read-BridgeJson {
         return $raw | ConvertFrom-Json
     } catch {
         return $Default
+    }
+}
+
+function Get-BridgeSyncState {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return [pscustomobject]@{ valid = $false; reason = 'missing'; cursor = '' }
+    }
+
+    try {
+        $raw = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            return [pscustomobject]@{ valid = $false; reason = 'empty'; cursor = '' }
+        }
+        if ($raw.IndexOf([char]0) -ge 0) {
+            return [pscustomobject]@{ valid = $false; reason = 'contains_nul'; cursor = '' }
+        }
+
+        $record = $raw | ConvertFrom-Json -AsHashtable -ErrorAction Stop
+        if ($record -isnot [System.Collections.IDictionary] -or -not $record.Contains('get_updates_buf')) {
+            return [pscustomobject]@{ valid = $false; reason = 'missing_cursor'; cursor = '' }
+        }
+        $cursor = ([string]$record['get_updates_buf']).Trim()
+        if ([string]::IsNullOrWhiteSpace($cursor)) {
+            return [pscustomobject]@{ valid = $false; reason = 'empty_cursor'; cursor = '' }
+        }
+        return [pscustomobject]@{ valid = $true; reason = 'healthy'; cursor = $cursor }
+    } catch {
+        return [pscustomobject]@{ valid = $false; reason = 'invalid_json'; cursor = '' }
+    }
+}
+
+function Move-BridgeInvalidSyncFile {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return '' }
+    $parent = Split-Path -Parent $Path
+    $stamp = Get-Date -Format 'yyyyMMddHHmmssfff'
+    $backupPath = Join-Path $parent "sync.corrupt-$stamp-$([guid]::NewGuid().ToString('N').Substring(0, 8)).json"
+    [System.IO.File]::Move($Path, $backupPath)
+    return $backupPath
+}
+
+function Save-BridgeSyncCursorFromResponse {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)]$Response
+    )
+
+    if (-not (Test-BridgeProperty -Object $Response -Name 'get_updates_buf')) {
+        throw 'WeChat getUpdates returned no durable cursor; the previous cursor was preserved.'
+    }
+    $cursor = ([string]$Response.get_updates_buf).Trim()
+    if ([string]::IsNullOrWhiteSpace($cursor)) {
+        throw 'WeChat getUpdates returned an empty durable cursor; the previous cursor was preserved.'
+    }
+    Write-BridgeJsonAtomic -Path $Path -Value @{ get_updates_buf = $cursor }
+    return $cursor
+}
+
+function Repair-BridgeSyncCursor {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$BaseUrl,
+        [Parameter(Mandatory)][string]$Token,
+        [int]$TimeoutSeconds = 40,
+        [scriptblock]$FetchUpdates
+    )
+
+    $createdNew = $false
+    $mutex = [System.Threading.Mutex]::new($false, 'Local\CodexWeChatSyncRepair', [ref]$createdNew)
+    $locked = $false
+    try {
+        try { $locked = $mutex.WaitOne([TimeSpan]::FromSeconds(15)) }
+        catch [System.Threading.AbandonedMutexException] { $locked = $true }
+        if (-not $locked) { throw 'Timed out while waiting for the WeChat cursor repair lock.' }
+
+        $state = Get-BridgeSyncState -Path $Path
+        if ([bool]$state.valid) {
+            return [pscustomobject]@{
+                recovered = $false
+                cursor = [string]$state.cursor
+                reason = 'healthy'
+                backup_path = ''
+                discarded_message_count = 0
+            }
+        }
+
+        $backupPath = Move-BridgeInvalidSyncFile -Path $Path
+        $response = if ($FetchUpdates) {
+            & $FetchUpdates
+        } else {
+            Invoke-IlinkRequest -BaseUrl $BaseUrl -Endpoint 'ilink/bot/getupdates' `
+                -Method POST -Body @{ get_updates_buf = ''; base_info = Get-BridgeBaseInfo } `
+                -Token $Token -TimeoutSeconds $TimeoutSeconds
+        }
+
+        $errcode = if ($response -and (Test-BridgeProperty -Object $response -Name 'errcode')) { [int]$response.errcode } else { 0 }
+        $ret = if ($response -and (Test-BridgeProperty -Object $response -Name 'ret')) { [int]$response.ret } else { 0 }
+        if ($errcode -ne 0 -or $ret -ne 0) {
+            throw "WeChat cursor recovery failed with errcode=$errcode, ret=$ret."
+        }
+        $discardedCount = @(if (Test-BridgeProperty -Object $response -Name 'msgs') { @($response.msgs) } else { @() }).Count
+        try {
+            $cursor = Save-BridgeSyncCursorFromResponse -Path $Path -Response $response
+        } catch {
+            throw "WeChat cursor recovery failed: $($_.Exception.Message)"
+        }
+        $fingerprint = [Convert]::ToHexString(
+            [System.Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($cursor))
+        ).Substring(0, 16).ToLowerInvariant()
+        $recovery = [ordered]@{
+            recovered_at = [DateTimeOffset]::Now.ToString('o')
+            reason = [string]$state.reason
+            backup_path = $backupPath
+            discarded_message_count = $discardedCount
+            cursor_fingerprint = $fingerprint
+        }
+        Write-BridgeJsonAtomic -Path (Join-Path (Split-Path -Parent $Path) 'sync-recovery.json') -Value $recovery
+        Write-BridgeLog -Level WARN -Message "WeChat cursor self-healed from '$($state.reason)'; discarded $discardedCount replay message(s) without execution."
+        return [pscustomobject]@{
+            recovered = $true
+            cursor = $cursor
+            reason = [string]$state.reason
+            backup_path = $backupPath
+            discarded_message_count = $discardedCount
+        }
+    } finally {
+        if ($locked) { try { $mutex.ReleaseMutex() } catch { } }
+        $mutex.Dispose()
+    }
+}
+
+function Invoke-WithBridgeNotificationGate {
+    param(
+        [Parameter(Mandatory)][scriptblock]$Action,
+        [int]$TimeoutSeconds = 60
+    )
+    $mutex = [Threading.Mutex]::new($false, 'Local\CodexWeChatNotificationGate')
+    $acquired = $false
+    try {
+        $acquired = $mutex.WaitOne([TimeSpan]::FromSeconds([Math]::Max(1, $TimeoutSeconds)))
+        if (-not $acquired) { throw 'Timed out while waiting for the notification queue lock.' }
+        return & $Action
+    } finally {
+        if ($acquired) { $mutex.ReleaseMutex() }
+        $mutex.Dispose()
+    }
+}
+
+function Get-BridgeNotificationResetState {
+    $path = Join-Path (Initialize-BridgeState) 'notification-reset.json'
+    return Read-BridgeJson -Path $path -Default $null
+}
+
+function ConvertTo-BridgeEventTime {
+    param([string]$Timestamp)
+    if ([string]::IsNullOrWhiteSpace($Timestamp)) { return $null }
+    $parsed = [DateTimeOffset]::MinValue
+    if (-not [DateTimeOffset]::TryParse($Timestamp, [ref]$parsed)) { return $null }
+    # PowerShell 7 may deserialize an ISO-8601 `Z` timestamp into DateTime and
+    # stringify it without its zone (for example, "08/17/2026 17:38:16").
+    # Codex rollout timestamps are UTC, so an unqualified lifecycle timestamp
+    # must remain UTC instead of being reinterpreted as the Windows local zone.
+    if ($Timestamp -notmatch '(?i)(?:z|[+-]\d{2}:?\d{2})$') {
+        $unspecifiedUtc = [DateTime]::SpecifyKind($parsed.DateTime, [DateTimeKind]::Unspecified)
+        return [DateTimeOffset]::new($unspecifiedUtc, [TimeSpan]::Zero)
+    }
+    return $parsed
+}
+
+function Get-BridgeQueuedRecordTime {
+    param(
+        $Record,
+        [Parameter(Mandatory)][IO.FileInfo]$File
+    )
+    foreach ($name in @('source_event_at', 'event_at', 'created_at')) {
+        if (-not $Record -or -not (Test-BridgeProperty -Object $Record -Name $name)) { continue }
+        if ($name -in @('source_event_at', 'event_at')) {
+            $eventTime = ConvertTo-BridgeEventTime -Timestamp ([string]$Record.$name)
+            if ($null -ne $eventTime) { return $eventTime }
+        } else {
+            $parsed = [DateTimeOffset]::MinValue
+            if ([DateTimeOffset]::TryParse([string]$Record.$name, [ref]$parsed)) { return $parsed }
+        }
+    }
+    return [DateTimeOffset]$File.LastWriteTimeUtc
+}
+
+function Test-BridgeNotificationAfterReset {
+    param([string]$Timestamp)
+    $reset = Get-BridgeNotificationResetState
+    if (-not $reset -or -not (Test-BridgeProperty -Object $reset -Name 'cutoff_at')) { return $true }
+    $cutoff = [DateTimeOffset]::MinValue
+    if (-not [DateTimeOffset]::TryParse([string]$reset.cutoff_at, [ref]$cutoff)) { return $true }
+    $candidate = ConvertTo-BridgeEventTime -Timestamp $Timestamp
+    if ($null -eq $candidate) { $candidate = [DateTimeOffset]::Now }
+    return $candidate -gt $cutoff
+}
+
+function Move-BridgeQueuedRecordsAtOrBeforeReset {
+    param([ValidateSet('outbox', 'attachment-outbox', 'all')][string]$Queue = 'all')
+    $root = Initialize-BridgeState
+    $reset = Get-BridgeNotificationResetState
+    if (-not $reset -or -not (Test-BridgeProperty -Object $reset -Name 'cutoff_at')) {
+        return [pscustomobject]@{ text = 0; attachments = 0 }
+    }
+    $cutoff = [DateTimeOffset]::MinValue
+    if (-not [DateTimeOffset]::TryParse([string]$reset.cutoff_at, [ref]$cutoff)) {
+        return [pscustomobject]@{ text = 0; attachments = 0 }
+    }
+    $archiveId = if ((Test-BridgeProperty -Object $reset -Name 'archive_id') -and $reset.archive_id) {
+        [string]$reset.archive_id
+    } else { 'reset-' + $cutoff.ToString('yyyyMMddHHmmssfff') }
+    $archiveRoot = Join-Path (Join-Path $root 'cleared') $archiveId
+    $queues = if ($Queue -eq 'all') { @('outbox', 'attachment-outbox') } else { @($Queue) }
+    $textCount = 0
+    $attachmentCount = 0
+    foreach ($queueName in $queues) {
+        $source = Join-Path $root $queueName
+        $destination = Join-Path $archiveRoot ("late-$queueName")
+        [IO.Directory]::CreateDirectory($destination) | Out-Null
+        foreach ($file in @(Get-ChildItem -LiteralPath $source -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+            $record = Read-BridgeJson -Path $file.FullName -Default $null
+            if ((Get-BridgeQueuedRecordTime -Record $record -File $file) -gt $cutoff) { continue }
+            if ($queueName -eq 'outbox' -and $record -and $record.session_id -and $record.turn_id) {
+                Set-CodexNotificationState -SessionId ([string]$record.session_id) `
+                    -TurnId ([string]$record.turn_id) -State suppressed
+            }
+            Move-Item -LiteralPath $file.FullName -Destination (Join-Path $destination $file.Name) -Force
+            if ($queueName -eq 'outbox') { $textCount++ } else { $attachmentCount++ }
+        }
+    }
+    if ($textCount -gt 0 -or $attachmentCount -gt 0) {
+        Write-BridgeLog -Level INFO -Message "Reset watermark archived late backlog: text=$textCount, attachments=$attachmentCount."
+    }
+    return [pscustomobject]@{ text = $textCount; attachments = $attachmentCount }
+}
+
+function Clear-CodexWeChatNotificationBacklog {
+    return Invoke-WithBridgeNotificationGate -Action {
+        $root = Initialize-BridgeState
+        $cutoff = [DateTimeOffset]::Now
+        $archiveId = 'reset-' + $cutoff.ToString('yyyyMMddHHmmssfff') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+        $archiveRoot = Join-Path (Join-Path $root 'cleared') $archiveId
+        [IO.Directory]::CreateDirectory($archiveRoot) | Out-Null
+        $resetPath = Join-Path $root 'notification-reset.json'
+        $reset = [ordered]@{
+            schema_version = 1
+            reset_id = [guid]::NewGuid().ToString('N')
+            archive_id = $archiveId
+            cutoff_at = $cutoff.ToString('o')
+            completed_at = $null
+            text_archived = 0
+            attachments_archived = 0
+        }
+        # Publish the cutoff before touching either queue. All producers and
+        # flushers consult this independent watermark, so a restart cannot
+        # resurrect an event that belongs to the pre-reset period.
+        Write-BridgeJsonAtomic -Path $resetPath -Value $reset
+
+        $textCount = 0
+        $attachmentCount = 0
+        foreach ($queueName in @('outbox', 'attachment-outbox')) {
+            $source = Join-Path $root $queueName
+            $destination = Join-Path $archiveRoot $queueName
+            [IO.Directory]::CreateDirectory($destination) | Out-Null
+            foreach ($file in @(Get-ChildItem -LiteralPath $source -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+                $record = Read-BridgeJson -Path $file.FullName -Default $null
+                if ($queueName -eq 'outbox' -and $record -and $record.session_id -and $record.turn_id) {
+                    Set-CodexNotificationState -SessionId ([string]$record.session_id) `
+                        -TurnId ([string]$record.turn_id) -State suppressed
+                }
+                Move-Item -LiteralPath $file.FullName -Destination (Join-Path $destination $file.Name) -Force
+                if ($queueName -eq 'outbox') { $textCount++ } else { $attachmentCount++ }
+            }
+        }
+        $reset.text_archived = $textCount
+        $reset.attachments_archived = $attachmentCount
+        $reset.completed_at = [DateTimeOffset]::Now.ToString('o')
+        Write-BridgeJsonAtomic -Path $resetPath -Value $reset
+        Write-BridgeLog -Level INFO -Message "Notification backlog reset completed: text=$textCount, attachments=$attachmentCount, archive=$archiveId."
+        return [pscustomobject]@{
+            cutoff_at = [string]$reset.cutoff_at
+            text_archived = $textCount
+            attachments_archived = $attachmentCount
+            archive_path = $archiveRoot
+        }
     }
 }
 
@@ -177,6 +525,9 @@ function Get-BridgeConfig {
         if ([string]$config.relay_transport -in @('desktop_ui', 'app_server')) {
             $config.relay_transport = 'desktop_single_writer'
         }
+        if ([int]$config.completion_attachment_max_files -eq 3) {
+            $config.completion_attachment_max_files = 10
+        }
         $changed = $true
     }
     if ([int]$config.context_refresh_timeout_seconds -lt 40) {
@@ -185,6 +536,14 @@ function Get-BridgeConfig {
     }
     if ([bool]$config.require_completion_quote -and [bool]$config.direct_reply_enabled) {
         $config.direct_reply_enabled = $false
+        $changed = $true
+    }
+    $allowedExtensions = @($config.completion_attachment_allowed_extensions | ForEach-Object {
+        ([string]$_).Trim().ToLowerInvariant()
+    } | Where-Object { $_ -and $_ -ne '.md' } | Select-Object -Unique)
+    if (@($config.completion_attachment_allowed_extensions).Count -ne $allowedExtensions.Count -or
+        @($config.completion_attachment_allowed_extensions | Where-Object { ([string]$_).Trim().ToLowerInvariant() -eq '.md' }).Count -gt 0) {
+        $config.completion_attachment_allowed_extensions = $allowedExtensions
         $changed = $true
     }
     if ($changed) { Write-BridgeJsonAtomic -Path $configPath -Value $config }
@@ -857,6 +1216,322 @@ function Queue-BridgeMessage {
     Write-BridgeJsonAtomic -Path (Join-Path (Join-Path $root 'outbox') $name) -Value $Message
 }
 
+function Get-BridgeAttachmentKey {
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$SessionId,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$TurnId,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Path,
+        [long]$Bytes = -1,
+        [string]$Sha256
+    )
+    $fullPath = try { [IO.Path]::GetFullPath($Path) } catch { $Path }
+    $material = '{0}|{1}|{2}|{3}' -f $SessionId.ToLowerInvariant(), $fullPath.ToLowerInvariant(), $Bytes, $Sha256
+    return [Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($material))
+    ).ToLowerInvariant()
+}
+
+function Test-BridgeAttachmentExtensionAllowed {
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Path)
+    $extension = [IO.Path]::GetExtension($Path)
+    if ([string]::IsNullOrWhiteSpace($extension)) { return $false }
+    $config = Get-BridgeConfig
+    $allowed = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($item in @($config.completion_attachment_allowed_extensions)) {
+        $normalized = ([string]$item).Trim()
+        if ([string]::IsNullOrWhiteSpace($normalized)) { continue }
+        if (-not $normalized.StartsWith('.')) { $normalized = ".$normalized" }
+        [void]$allowed.Add($normalized)
+    }
+    return $allowed.Contains($extension)
+}
+
+function Get-BridgeAttachmentQueueRecords {
+    param(
+        [string]$SessionId,
+        [string]$TurnId,
+        [ValidateSet('queued', 'sent', 'failed', 'all')][string]$State = 'all'
+    )
+    $root = Initialize-BridgeState
+    $folders = switch ($State) {
+        'queued' { @('attachment-outbox') }
+        'sent' { @('attachment-sent') }
+        'failed' { @('attachment-failed') }
+        default { @('attachment-outbox', 'attachment-sent', 'attachment-failed') }
+    }
+    $records = foreach ($folder in $folders) {
+        foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $root $folder) -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+            $record = Read-BridgeJson -Path $file.FullName -Default $null
+            if (-not $record) { continue }
+            if ($SessionId -and [string]$record.session_id -ne $SessionId) { continue }
+            if ($TurnId -and [string]$record.turn_id -ne $TurnId) { continue }
+            [pscustomobject]@{ file = $file; record = $record; folder = $folder }
+        }
+    }
+    return @($records | Sort-Object { [DateTimeOffset]$_.record.created_at }, { [int]$_.record.ordinal })
+}
+
+function Add-BridgeAttachmentQueueRecord {
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$SessionId,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$TurnId,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ThreadName,
+        [string]$Cwd,
+        [Parameter(Mandatory)]$Attachment,
+        [int]$Ordinal = 1,
+        [int]$Total = 1,
+        [string]$Source = 'completion'
+    )
+    $path = if ($Attachment -is [string]) { [string]$Attachment } else { [string]$Attachment.path }
+    if ([string]::IsNullOrWhiteSpace($path)) { return $null }
+    $fullPath = try { [IO.Path]::GetFullPath($path) } catch { $path }
+    if (-not (Test-BridgeAttachmentExtensionAllowed -Path $fullPath)) {
+        Write-BridgeLog -Level INFO -Message "Skipped attachment queue request because its extension is not deliverable: $([IO.Path]::GetFileName($fullPath))"
+        return [pscustomobject]@{ queued = $false; duplicate = $false; excluded = $true; key = $null; path = $null }
+    }
+    $bytes = if ($Attachment -isnot [string] -and (Test-BridgeProperty -Object $Attachment -Name 'bytes')) {
+        [long]$Attachment.bytes
+    } elseif (Test-Path -LiteralPath $fullPath -PathType Leaf) {
+        [long](Get-Item -LiteralPath $fullPath).Length
+    } else { -1L }
+    $sha256 = if (Test-Path -LiteralPath $fullPath -PathType Leaf) {
+        (Get-FileHash -Algorithm SHA256 -LiteralPath $fullPath).Hash.ToLowerInvariant()
+    } else { '' }
+    $key = Get-BridgeAttachmentKey -SessionId $SessionId -TurnId $TurnId -Path $fullPath -Bytes $bytes -Sha256 $sha256
+    $root = Initialize-BridgeState
+    foreach ($folder in @('attachment-outbox', 'attachment-sent', 'attachment-failed')) {
+        $existing = Join-Path (Join-Path $root $folder) "$key.json"
+        if (Test-Path -LiteralPath $existing -PathType Leaf) {
+            return [pscustomobject]@{ queued = $false; duplicate = $true; key = $key; path = $existing }
+        }
+    }
+    $now = [DateTimeOffset]::Now.ToString('o')
+    $record = [ordered]@{
+        id = $key
+        type = 'codex_completion_attachment'
+        state = 'queued'
+        session_id = $SessionId
+        turn_id = $TurnId
+        thread_name = $ThreadName
+        cwd = $Cwd
+        path = $fullPath
+        name = if ($Attachment -isnot [string] -and (Test-BridgeProperty -Object $Attachment -Name 'name')) {
+            [string]$Attachment.name
+        } else { [IO.Path]::GetFileName($fullPath) }
+        bytes = $bytes
+        sha256 = $sha256
+        ordinal = $Ordinal
+        total = $Total
+        attempts = 0
+        next_attempt_at = $now
+        last_attempt_at = $null
+        last_error = $null
+        source = $Source
+        created_at = $now
+        updated_at = $now
+        format_version = 1
+    }
+    $destination = Join-Path (Join-Path $root 'attachment-outbox') "$key.json"
+    Write-BridgeJsonAtomic -Path $destination -Value $record
+    return [pscustomobject]@{ queued = $true; duplicate = $false; key = $key; path = $destination }
+}
+
+function Save-BridgeAttachmentCatalog {
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$SessionId,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$TurnId,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ThreadName,
+        [string]$Cwd,
+        [Parameter(Mandatory)]$Plan,
+        $QueueResult
+    )
+    $keyMaterial = "$SessionId|$TurnId"
+    $key = [Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($keyMaterial))
+    ).ToLowerInvariant()
+    $record = [ordered]@{
+        id = $key
+        session_id = $SessionId
+        turn_id = $TurnId
+        thread_name = $ThreadName
+        cwd = $Cwd
+        recognized = [int]$Plan.recognized
+        eligible = @($Plan.eligible)
+        filtered = @($Plan.filtered)
+        oversized = @($Plan.oversized)
+        over_limit = @($Plan.over_limit)
+        queue_stats = if ($QueueResult) {
+            [ordered]@{
+                queued = [int]$QueueResult.queued
+                duplicates = [int]$QueueResult.duplicates
+                total = [int]$QueueResult.total
+            }
+        } else { [ordered]@{ queued = 0; duplicates = 0; total = 0 } }
+        delivery_summary_sent = $false
+        created_at = [DateTimeOffset]::Now.ToString('o')
+        format_version = 1
+    }
+    $path = Join-Path (Join-Path (Initialize-BridgeState) 'attachment-catalog') "$key.json"
+    Write-BridgeJsonAtomic -Path $path -Value $record
+    $routePath = Join-Path (Join-Path (Initialize-BridgeState) 'attachment-catalog') 'latest-by-session.json'
+    $routes = Read-BridgeJson -Path $routePath -Default @{} -AsHashtable
+    $routes[$SessionId] = $key
+    Write-BridgeJsonAtomic -Path $routePath -Value $routes
+    return $path
+}
+
+function Get-BridgeAttachmentCatalog {
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$SessionId,
+        [string]$TurnId
+    )
+    $catalogPath = Join-Path (Initialize-BridgeState) 'attachment-catalog'
+    if (-not $TurnId) {
+        $routePath = Join-Path $catalogPath 'latest-by-session.json'
+        $routes = Read-BridgeJson -Path $routePath -Default @{} -AsHashtable
+        if ($routes.ContainsKey($SessionId)) {
+            $latestPath = Join-Path $catalogPath ("$([string]$routes[$SessionId]).json")
+            $latestRecord = Read-BridgeJson -Path $latestPath -Default $null
+            if ($latestRecord) { return @([pscustomobject]@{ file = Get-Item -LiteralPath $latestPath; record = $latestRecord }) }
+        }
+    }
+    $matches = foreach ($file in @(Get-ChildItem -LiteralPath $catalogPath `
+        -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+        if ($file.Name -eq 'latest-by-session.json') { continue }
+        $record = Read-BridgeJson -Path $file.FullName -Default $null
+        if (-not $record -or [string]$record.session_id -ne $SessionId) { continue }
+        if ($TurnId -and [string]$record.turn_id -ne $TurnId) { continue }
+        [pscustomobject]@{ file = $file; record = $record }
+    }
+    return @($matches | Sort-Object { [DateTimeOffset]$_.record.created_at } -Descending | Select-Object -First 1)
+}
+
+function Add-BridgeAttachmentQueueRecords {
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$SessionId,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$TurnId,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ThreadName,
+        [string]$Cwd,
+        [object[]]$Attachments = @(),
+        [string]$Source = 'completion'
+    )
+    $records = @($Attachments)
+    $queued = 0
+    $duplicates = 0
+    $excluded = 0
+    for ($index = 0; $index -lt $records.Count; $index++) {
+        $result = Add-BridgeAttachmentQueueRecord -SessionId $SessionId -TurnId $TurnId `
+            -ThreadName $ThreadName -Cwd $Cwd -Attachment $records[$index] `
+            -Ordinal ($index + 1) -Total $records.Count -Source $Source
+        if ($result -and [bool]$result.queued) { $queued++ }
+        elseif ($result -and [bool]$result.duplicate) { $duplicates++ }
+        elseif ($result -and (Test-BridgeProperty -Object $result -Name 'excluded') -and [bool]$result.excluded) { $excluded++ }
+    }
+    return [pscustomobject]@{ queued = $queued; duplicates = $duplicates; excluded = $excluded; total = $records.Count }
+}
+
+function Move-BridgeAttachmentQueueRecord {
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Path,
+        [Parameter(Mandatory)][ValidateSet('sent', 'failed')][string]$State,
+        [Parameter(Mandatory)]$Record
+    )
+    $root = Initialize-BridgeState
+    if (Test-BridgeProperty -Object $Record -Name 'state') { $Record.state = $State }
+    else { $Record | Add-Member -NotePropertyName state -NotePropertyValue $State }
+    $updatedAt = [DateTimeOffset]::Now.ToString('o')
+    if (Test-BridgeProperty -Object $Record -Name 'updated_at') { $Record.updated_at = $updatedAt }
+    else { $Record | Add-Member -NotePropertyName updated_at -NotePropertyValue $updatedAt }
+    $folder = if ($State -eq 'sent') { 'attachment-sent' } else { 'attachment-failed' }
+    $destination = Join-Path (Join-Path $root $folder) ([IO.Path]::GetFileName($Path))
+    Write-BridgeJsonAtomic -Path $destination -Value $Record
+    Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    return $destination
+}
+
+function Remove-BridgeDisallowedQueuedAttachments {
+    $root = Initialize-BridgeState
+    $removed = 0
+    foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $root 'attachment-outbox') -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+        $record = Read-BridgeJson -Path $file.FullName -Default $null
+        if (-not $record -or [string]::IsNullOrWhiteSpace([string]$record.path) -or
+            (Test-BridgeAttachmentExtensionAllowed -Path ([string]$record.path))) { continue }
+        if (Test-BridgeProperty -Object $record -Name 'state') { $record.state = 'skipped' }
+        else { $record | Add-Member -NotePropertyName state -NotePropertyValue 'skipped' }
+        if (Test-BridgeProperty -Object $record -Name 'skip_reason') { $record.skip_reason = 'extension_not_allowed' }
+        else { $record | Add-Member -NotePropertyName skip_reason -NotePropertyValue 'extension_not_allowed' }
+        $skippedAt = [DateTimeOffset]::Now.ToString('o')
+        if (Test-BridgeProperty -Object $record -Name 'skipped_at') { $record.skipped_at = $skippedAt }
+        else { $record | Add-Member -NotePropertyName skipped_at -NotePropertyValue $skippedAt }
+        $destination = Join-Path (Join-Path $root 'attachment-skipped') $file.Name
+        Write-BridgeJsonAtomic -Path $destination -Value $record
+        Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+        $removed++
+    }
+    if ($removed -gt 0) {
+        Write-BridgeLog -Level INFO -Message "Removed $removed queued attachment(s) whose extensions are no longer deliverable. Local files were not deleted."
+    }
+    return $removed
+}
+
+function Get-BridgeAttachmentRetryDelaySeconds {
+    param([Parameter(Mandatory)][ValidateRange(1, 2147483647)][int]$Attempt)
+    $config = Get-BridgeConfig
+    $delays = @($config.completion_attachment_retry_delays_seconds | ForEach-Object { [Math]::Max(1, [int]$_) })
+    if ($delays.Count -eq 0) { $delays = @(60, 300, 900, 3600, 10800, 21600) }
+    return [int]$delays[[Math]::Min($Attempt - 1, $delays.Count - 1)]
+}
+
+function Test-BridgeAttachmentPermanentError {
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Message)
+    return [regex]::IsMatch($Message, '(?i)Attachment not found|exceeds the configured limit|not supported|invalid path|Access.+denied')
+}
+
+function Publish-BridgeCompletedAttachmentSummaries {
+    $root = Initialize-BridgeState
+    $catalogPath = Join-Path $root 'attachment-catalog'
+    foreach ($file in @(Get-ChildItem -LiteralPath $catalogPath -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+        if ($file.Name -eq 'latest-by-session.json') { continue }
+        $catalog = Read-BridgeJson -Path $file.FullName -Default $null
+        if (-not $catalog -or ((Test-BridgeProperty -Object $catalog -Name 'delivery_summary_sent') -and
+            [bool]$catalog.delivery_summary_sent)) { continue }
+        $expected = if ((Test-BridgeProperty -Object $catalog -Name 'queue_stats') -and $catalog.queue_stats) {
+            [int]$catalog.queue_stats.total
+        } else { @($catalog.eligible).Count }
+        if ($expected -le 0) {
+            if (Test-BridgeProperty -Object $catalog -Name 'delivery_summary_sent') { $catalog.delivery_summary_sent = $true }
+            else { $catalog | Add-Member -NotePropertyName delivery_summary_sent -NotePropertyValue $true }
+            Write-BridgeJsonAtomic -Path $file.FullName -Value $catalog
+            continue
+        }
+        $records = @(Get-BridgeAttachmentQueueRecords -SessionId ([string]$catalog.session_id) `
+            -TurnId ([string]$catalog.turn_id) -State all)
+        $queued = @($records | Where-Object { $_.folder -eq 'attachment-outbox' }).Count
+        if ($queued -gt 0) { continue }
+        $sent = @($records | Where-Object { $_.folder -eq 'attachment-sent' }).Count
+        $failed = @($records | Where-Object { $_.folder -eq 'attachment-failed' }).Count
+        $duplicates = if ((Test-BridgeProperty -Object $catalog -Name 'queue_stats') -and $catalog.queue_stats) {
+            [int]$catalog.queue_stats.duplicates
+        } else { 0 }
+        if (($sent + $failed + $duplicates) -lt $expected) { continue }
+        $text = "【附件完成】$([string]$catalog.thread_name)`n已发送 $sent 个"
+        if ($duplicates -gt 0) { $text += "，已有/重复 $duplicates 个" }
+        if ($failed -gt 0) { $text += "，失败 $failed 个；可引用原【已完成】通知发送 /附件 重试" }
+        $text += '。'
+        try {
+            Send-BridgeText -Text $text -AllowContextlessRetry -TimeoutSeconds 15 | Out-Null
+            if (Test-BridgeProperty -Object $catalog -Name 'delivery_summary_sent') { $catalog.delivery_summary_sent = $true }
+            else { $catalog | Add-Member -NotePropertyName delivery_summary_sent -NotePropertyValue $true }
+            $summarySentAt = [DateTimeOffset]::Now.ToString('o')
+            if (Test-BridgeProperty -Object $catalog -Name 'delivery_summary_sent_at') { $catalog.delivery_summary_sent_at = $summarySentAt }
+            else { $catalog | Add-Member -NotePropertyName delivery_summary_sent_at -NotePropertyValue $summarySentAt }
+            Write-BridgeJsonAtomic -Path $file.FullName -Value $catalog
+        } catch {
+            Write-BridgeLog -Level WARN -Message "Attachment completion summary deferred: $($_.Exception.Message)"
+        }
+    }
+}
+
 function Get-CodexThreadShortId {
     param([Parameter(Mandatory)][string]$SessionId)
     $bytes = [Text.Encoding]::UTF8.GetBytes($SessionId)
@@ -1300,6 +1975,7 @@ function Resolve-BridgeReplyTarget {
             session_id = [string]$target.session_id
             thread_name = [string]$target.thread_name
             cwd = [string]$target.cwd
+            turn_id = if (Test-BridgeProperty -Object $target -Name 'turn_id') { [string]$target.turn_id } else { '' }
         }
     } finally {
         if ($locked) { try { $mutex.ReleaseMutex() } catch { } }
@@ -1599,6 +2275,121 @@ function Set-CodexNotificationState {
     }
 }
 
+function Remove-CodexSuppressedNotificationKeyForRecovery {
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$SessionId,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$TurnId,
+        [Parameter(Mandatory)][DateTimeOffset]$NotBefore
+    )
+    $createdNew = $false
+    $mutex = [System.Threading.Mutex]::new($false, 'Local\CodexWeChatNotificationHistory', [ref]$createdNew)
+    $locked = $false
+    try {
+        try { $locked = $mutex.WaitOne(10000) } catch [System.Threading.AbandonedMutexException] { $locked = $true }
+        if (-not $locked) { throw 'Timed out while recovering notification history.' }
+        $path = Join-Path (Initialize-BridgeState) 'notification-history.json'
+        $history = Read-BridgeJson -Path $path -Default @{ keys = @{} } -AsHashtable
+        $key = "$SessionId|$TurnId"
+        if (-not $history.ContainsKey('keys') -or -not $history.keys.ContainsKey($key)) { return $false }
+        $record = $history.keys[$key]
+        $recordedAt = [DateTimeOffset]::MinValue
+        if ([string]$record.state -ne 'suppressed' -or
+            -not [DateTimeOffset]::TryParse([string]$record.recorded_at, [ref]$recordedAt) -or
+            $recordedAt -lt $NotBefore) { return $false }
+        [void]$history.keys.Remove($key)
+        Write-BridgeJsonAtomic -Path $path -Value $history
+        return $true
+    } finally {
+        if ($locked) { try { $mutex.ReleaseMutex() } catch { } }
+        $mutex.Dispose()
+    }
+}
+
+function Split-BridgeTextByBoundary {
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Text,
+        [Parameter(Mandatory)][ValidateRange(200, 10000)][int]$MaxChars,
+        [Parameter(Mandatory)][ValidateRange(1, 20)][int]$MaxParts
+    )
+    $remaining = ($Text -replace "`r`n?", "`n").Trim()
+    $parts = [System.Collections.Generic.List[string]]::new()
+    while ($remaining.Length -gt $MaxChars -and $parts.Count -lt ($MaxParts - 1)) {
+        $window = $remaining.Substring(0, $MaxChars)
+        $minimumBreak = [Math]::Max(80, [int][Math]::Floor($MaxChars * 0.45))
+        $splitAt = -1
+        $separatorLength = 0
+        foreach ($separator in @("`n`n", "`n", '。', '！', '？', '；', ';', '，', ',', ' ')) {
+            $candidate = $window.LastIndexOf($separator, [StringComparison]::Ordinal)
+            if ($candidate -ge $minimumBreak -and $candidate -gt $splitAt) {
+                $splitAt = $candidate
+                $separatorLength = $separator.Length
+            }
+        }
+        $takeLength = if ($splitAt -ge $minimumBreak) { $splitAt + $separatorLength } else { $MaxChars }
+        if ($takeLength -gt 0 -and $takeLength -lt $remaining.Length -and
+            [char]::IsHighSurrogate($remaining[$takeLength - 1])) { $takeLength-- }
+        $part = $remaining.Substring(0, $takeLength).Trim()
+        if ($part) { $parts.Add($part) }
+        $remaining = $remaining.Substring($takeLength).TrimStart()
+    }
+    if ($remaining) {
+        if ($remaining.Length -gt $MaxChars) {
+            $takeLength = $MaxChars - 1
+            if ($takeLength -gt 0 -and [char]::IsHighSurrogate($remaining[$takeLength - 1])) { $takeLength-- }
+            $remaining = $remaining.Substring(0, $takeLength).TrimEnd() + '…'
+        }
+        $parts.Add($remaining)
+    }
+    return @($parts)
+}
+
+function New-CodexCompletionTextBundle {
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Name,
+        [string]$Summary,
+        [int]$ChunkChars,
+        [int]$MaxChunks
+    )
+    $cleanName = ($Name -replace '\s+', ' ').Trim()
+    if ([string]::IsNullOrWhiteSpace($Summary)) { $Summary = '本轮处理已经结束，请打开 Codex 查看结果。' }
+    $cleanSummary = [regex]::Replace(
+        $Summary.Trim(),
+        ':codex-file-citation\{path="([^"]+)"[^}]*\}',
+        '文件：$1'
+    )
+    $header = "【已完成】$cleanName"
+    $safeChunkChars = [Math]::Max(400, $(if ($ChunkChars -gt 0) { $ChunkChars } else { 1100 }))
+    $safeMaxChunks = [Math]::Min(12, [Math]::Max(1, $(if ($MaxChunks -gt 0) { $MaxChunks } else { 6 })))
+    if (($header.Length + 1 + $cleanSummary.Length) -le $safeChunkChars) {
+        return [pscustomobject]@{
+            summary = $cleanSummary
+            parts = @("$header`n$cleanSummary")
+            truncated = $false
+        }
+    }
+
+    # Reserve enough room for the repeated routable header and a marker such
+    # as （12/12）. Every segment remains independently quote-routable.
+    $bodyChars = [Math]::Max(200, $safeChunkChars - $header.Length - 16)
+    $maxSummaryChars = $bodyChars * $safeMaxChunks
+    $truncated = $cleanSummary.Length -gt $maxSummaryChars
+    if ($truncated) {
+        $takeLength = $maxSummaryChars - 1
+        if ($takeLength -gt 0 -and [char]::IsHighSurrogate($cleanSummary[$takeLength - 1])) { $takeLength-- }
+        $cleanSummary = $cleanSummary.Substring(0, $takeLength).TrimEnd() + '…'
+    }
+    $bodies = @(Split-BridgeTextByBoundary -Text $cleanSummary -MaxChars $bodyChars -MaxParts $safeMaxChunks)
+    $count = $bodies.Count
+    $parts = for ($index = 0; $index -lt $count; $index++) {
+        "$header`n（$($index + 1)/$count）`n$($bodies[$index])"
+    }
+    return [pscustomobject]@{
+        summary = $cleanSummary
+        parts = @($parts)
+        truncated = $truncated
+    }
+}
+
 function Format-CodexCompletionText {
     param(
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Name,
@@ -1614,20 +2405,32 @@ function Format-CodexCompletionText {
     return "【已完成】$cleanName`n$cleanSummary"
 }
 
-function Get-CodexCompletionAttachments {
+function Get-CodexCompletionAttachmentPlan {
     param(
         [string]$Text,
         [string]$Cwd
     )
-    if ([string]::IsNullOrWhiteSpace($Text)) { return @() }
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return [pscustomobject]@{ recognized = 0; eligible = @(); filtered = @(); oversized = @(); over_limit = @() }
+    }
     $config = Get-BridgeConfig
-    if (-not [bool]$config.completion_attachments_enabled) { return @() }
+    if (-not [bool]$config.completion_attachments_enabled) {
+        return [pscustomobject]@{ recognized = 0; eligible = @(); filtered = @(); oversized = @(); over_limit = @() }
+    }
+    $allowedExtensions = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($extension in @($config.completion_attachment_allowed_extensions)) {
+        $normalized = [string]$extension
+        if ([string]::IsNullOrWhiteSpace($normalized)) { continue }
+        if (-not $normalized.StartsWith('.')) { $normalized = ".$normalized" }
+        [void]$allowedExtensions.Add($normalized)
+    }
     $candidates = [System.Collections.Generic.List[string]]::new()
+    $filtered = [System.Collections.Generic.List[object]]::new()
     $patterns = @(
         ':codex-file-citation\{path="(?<path>[^"]+)"[^}]*\}',
         '\]\(<(?<path>/?[A-Za-z]:[\\/][^>]+)>\)',
         '\]\((?<path>/?[A-Za-z]:[\\/][^)]+)\)',
-        '(?:交付文件|输出文件|附件|下载|交付|文件)\s*[：:]\s*(?<path>/?[A-Za-z]:[\\/][^\r\n"''<>|?*]+?\.(?:docx|xlsx|xls|pptx|ppt|pdf|zip|7z|rar|txt|md|csv|json|png|jpe?g|gif|svg|html|htm|py|m|mlx))'
+        '(?:交付文件|输出文件|附件|下载|交付|文件)\s*[：:]\s*(?<path>/?[A-Za-z]:[\\/][^\r\n"''<>|?*]+?\.[A-Za-z0-9]{1,10})'
     )
     foreach ($pattern in $patterns) {
         foreach ($match in [regex]::Matches($Text, $pattern, [Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
@@ -1639,27 +2442,66 @@ function Get-CodexCompletionAttachments {
             }
             try { $candidate = [System.IO.Path]::GetFullPath($candidate) } catch { continue }
             if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+            $candidateExtension = [System.IO.Path]::GetExtension($candidate)
+            if ($allowedExtensions.Count -eq 0 -or -not $allowedExtensions.Contains($candidateExtension)) {
+                Write-BridgeLog -Level INFO -Message "Skipped non-deliverable completion attachment: $([System.IO.Path]::GetFileName($candidate))"
+                $filtered.Add([pscustomobject]@{
+                    path = $candidate
+                    name = [IO.Path]::GetFileName($candidate)
+                    reason = 'extension_not_allowed'
+                })
+                continue
+            }
             if (-not $candidates.Contains($candidate)) { $candidates.Add($candidate) }
         }
     }
     $maxFiles = [Math]::Max(0, [int]$config.completion_attachment_max_files)
     $maxBytes = [long]$config.completion_attachment_max_bytes
-    $records = foreach ($path in @($candidates | Select-Object -First $maxFiles)) {
+    $oversized = [System.Collections.Generic.List[object]]::new()
+    $overLimit = [System.Collections.Generic.List[object]]::new()
+    $eligible = [System.Collections.Generic.List[object]]::new()
+    $candidateIndex = 0
+    foreach ($path in @($candidates)) {
+        $candidateIndex++
         $item = Get-Item -LiteralPath $path
         if ($item.Length -gt $maxBytes) {
             Write-BridgeLog -Level WARN -Message "Skipped oversized completion attachment: $($item.Name) ($($item.Length) bytes)."
+            $oversized.Add([pscustomobject]@{ path = $item.FullName; name = $item.Name; bytes = [long]$item.Length; reason = 'oversized' })
             continue
         }
-        [pscustomobject]@{
+        $record = [pscustomobject]@{
             path = $item.FullName
             name = $item.Name
             bytes = [long]$item.Length
         }
+        if ($eligible.Count -lt $maxFiles) { $eligible.Add($record) }
+        else { $overLimit.Add($record) }
     }
-    return @($records)
+    return [pscustomobject]@{
+        recognized = $candidates.Count + $filtered.Count
+        eligible = @($eligible)
+        filtered = @($filtered)
+        oversized = @($oversized)
+        over_limit = @($overLimit)
+    }
+}
+
+function Get-CodexCompletionAttachments {
+    param([string]$Text, [string]$Cwd)
+    return @((Get-CodexCompletionAttachmentPlan -Text $Text -Cwd $Cwd).eligible)
 }
 
 function Publish-CodexTurnNotification {
+    param(
+        [Parameter(Mandatory)]$HookEvent,
+        [switch]$SuppressNotification
+    )
+    return Invoke-WithBridgeNotificationGate -Action {
+        Invoke-CodexTurnNotificationCore -HookEvent $HookEvent -SuppressNotification:$SuppressNotification
+    }
+}
+
+function Invoke-CodexTurnNotificationCore {
     param(
         [Parameter(Mandatory)]$HookEvent,
         [switch]$SuppressNotification
@@ -1694,6 +2536,12 @@ function Publish-CodexTurnNotification {
         Register-CodexNotificationKey -SessionId $sessionId -TurnId $turnId -State suppressed | Out-Null
         return [pscustomobject]@{ suppressed = $true }
     }
+    $sourceEventAt = if (Test-BridgeProperty -Object $HookEvent -Name 'event_at') { [string]$HookEvent.event_at } else { '' }
+    if (-not (Test-BridgeNotificationAfterReset -Timestamp $sourceEventAt)) {
+        Register-CodexNotificationKey -SessionId $sessionId -TurnId $turnId -State suppressed | Out-Null
+        Write-BridgeLog -Level INFO -Message "Notification reset suppressed pre-cutoff completion $sessionId/$turnId."
+        return [pscustomobject]@{ suppressed = $true; reset = $true }
+    }
 
     $config = Get-BridgeConfig
     if (-not $config.notifications_enabled) { return [pscustomobject]@{ skipped = $true } }
@@ -1702,10 +2550,36 @@ function Publish-CodexTurnNotification {
     }
     $summary = [string]$HookEvent.last_assistant_message
     if ([string]::IsNullOrWhiteSpace($summary)) { $summary = '本轮处理已经结束，请打开 Codex 查看结果。' }
-    $limit = if ($config.notify_summary_chars) { [int]$config.notify_summary_chars } else { 700 }
-    if ($summary.Length -gt $limit) { $summary = $summary.Substring(0, $limit) + '…' }
-    $text = Format-CodexCompletionText -Name $displayName -Summary $summary
-    $attachments = @(Get-CodexCompletionAttachments -Text $registrySummary -Cwd ([string]$HookEvent.cwd))
+    $chunkChars = if ($config.completion_text_chunk_chars) { [int]$config.completion_text_chunk_chars } else { 1100 }
+    $maxChunks = if ($config.completion_text_max_chunks) { [int]$config.completion_text_max_chunks } else { 6 }
+    $attachmentPlan = Get-CodexCompletionAttachmentPlan -Text $registrySummary -Cwd ([string]$HookEvent.cwd)
+    $attachments = @($attachmentPlan.eligible)
+    $excludedAttachmentCount = @($attachmentPlan.filtered).Count + @($attachmentPlan.oversized).Count
+    $overLimitAttachmentCount = @($attachmentPlan.over_limit).Count
+    $queueResult = [pscustomobject]@{ queued = 0; duplicates = 0; total = 0 }
+    if ($attachments.Count -gt 0) {
+        $queueResult = Add-BridgeAttachmentQueueRecords -SessionId $sessionId -TurnId $turnId `
+            -ThreadName $displayName -Cwd ([string]$HookEvent.cwd) -Attachments $attachments
+        Write-BridgeLog -Level INFO -Message (
+            "Completion attachments prepared: recognized=$($attachmentPlan.recognized), queued=$($queueResult.queued), " +
+            "duplicates=$($queueResult.duplicates), excluded=$excludedAttachmentCount, over_limit=$overLimitAttachmentCount."
+        )
+    }
+    Save-BridgeAttachmentCatalog -SessionId $sessionId -TurnId $turnId -ThreadName $displayName `
+        -Cwd ([string]$HookEvent.cwd) -Plan $attachmentPlan -QueueResult $queueResult | Out-Null
+    if ([int]$attachmentPlan.recognized -gt 0) {
+        $attachmentSummary = "附件：识别 $([int]$attachmentPlan.recognized) 个，本轮加入发送队列 $([int]$queueResult.queued) 个"
+        if ([int]$queueResult.duplicates -gt 0) { $attachmentSummary += "，已有 $([int]$queueResult.duplicates) 个在队列中或已发送" }
+        if ($excludedAttachmentCount -gt 0) { $attachmentSummary += "，已排除 $excludedAttachmentCount 个" }
+        if ($overLimitAttachmentCount -gt 0) { $attachmentSummary += "，另有 $overLimitAttachmentCount 个超过自动发送上限" }
+        $attachmentSummary += '。可引用本通知发送 /附件 查看或重试。'
+        $summary = "$attachmentSummary`n`n$summary"
+    }
+    $textBundle = New-CodexCompletionTextBundle -Name $displayName -Summary $summary `
+        -ChunkChars $chunkChars -MaxChunks $maxChunks
+    $summary = [string]$textBundle.summary
+    $textParts = @($textBundle.parts)
+    $text = [string]$textParts[0]
     $message = [ordered]@{
         id = [guid]::NewGuid().ToString('N')
         type = 'codex_turn_complete'
@@ -1715,28 +2589,44 @@ function Publish-CodexTurnNotification {
         thread_name = $displayName
         cwd = [string]$HookEvent.cwd
         summary = $summary
+        text_parts = $textParts
+        next_text_index = 0
+        wechat_message_ids = @()
         attachments = $attachments
         text_sent = $false
         wechat_message_id = $null
         next_attachment_index = 0
-        format_version = 4
+        attachment_stats = [ordered]@{
+            recognized = [int]$attachmentPlan.recognized
+            queued = $attachments.Count
+            excluded = $excludedAttachmentCount
+            over_limit = $overLimitAttachmentCount
+        }
+        format_version = 7
+        source_event_at = $sourceEventAt
         created_at = [DateTimeOffset]::Now.ToString('o')
     }
+    $message.attachments = @()
+    $message.next_attachment_index = 0
     try {
-        $textDelivery = Send-BridgeRoutableText -Text $text -AllowContextlessRetry -TimeoutSeconds 15
-        $message.text_sent = $true
-        $message.wechat_message_id = [string]$textDelivery.message_id
-        Register-BridgeReplyTarget -SessionId $sessionId -ThreadName $displayName `
-            -Cwd ([string]$HookEvent.cwd) -TurnId $turnId -WeChatMessageId ([string]$textDelivery.message_id) `
-            -SendStartedAt ([string]$textDelivery.send_started_at) -SendCompletedAt ([string]$textDelivery.send_completed_at)
-        Set-CodexNotificationState -SessionId $sessionId -TurnId $turnId -State sent
-        if ($attachments.Count -gt 0) {
-            Queue-BridgeMessage -Message $message
-            Write-BridgeLog -Level INFO -Message "Codex completion text sent; $($attachments.Count) attachment(s) queued separately."
-            return [pscustomobject]@{ sent = $true; attachments_queued = $attachments.Count }
+        foreach ($textPart in $textParts) {
+            $textDelivery = Send-BridgeRoutableText -Text ([string]$textPart) -AllowContextlessRetry -TimeoutSeconds 15
+            $message.next_text_index = [int]$message.next_text_index + 1
+            $message.wechat_message_ids = @($message.wechat_message_ids) + [string]$textDelivery.message_id
+            $message.wechat_message_id = [string]$textDelivery.message_id
+            Register-BridgeReplyTarget -SessionId $sessionId -ThreadName $displayName `
+                -Cwd ([string]$HookEvent.cwd) -TurnId $turnId -WeChatMessageId ([string]$textDelivery.message_id) `
+                -SendStartedAt ([string]$textDelivery.send_started_at) -SendCompletedAt ([string]$textDelivery.send_completed_at)
         }
-        Write-BridgeLog -Level INFO -Message 'Codex completion notification text sent.'
-        return [pscustomobject]@{ sent = $true; attachments_queued = 0 }
+        $message.text_sent = $true
+        Set-CodexNotificationState -SessionId $sessionId -TurnId $turnId -State sent
+        Write-BridgeLog -Level INFO -Message "Codex completion notification text sent in $($textParts.Count) part(s)."
+        return [pscustomobject]@{
+            sent = $true
+            attachments_queued = [int]$queueResult.queued
+            attachments_excluded = $excludedAttachmentCount
+            attachments_over_limit = $overLimitAttachmentCount
+        }
     } catch {
         Queue-BridgeMessage -Message $message
         Set-CodexNotificationState -SessionId $sessionId -TurnId $turnId -State queued
@@ -1746,6 +2636,17 @@ function Publish-CodexTurnNotification {
 }
 
 function Publish-CodexStateNotification {
+    param(
+        [Parameter(Mandatory)]$HookEvent,
+        [Parameter(Mandatory)][ValidateSet('paused', 'failed')][string]$State,
+        [string]$Reason
+    )
+    return Invoke-WithBridgeNotificationGate -Action {
+        Invoke-CodexStateNotificationCore -HookEvent $HookEvent -State $State -Reason $Reason
+    }
+}
+
+function Invoke-CodexStateNotificationCore {
     param(
         [Parameter(Mandatory)]$HookEvent,
         [Parameter(Mandatory)][ValidateSet('paused', 'failed')][string]$State,
@@ -1773,6 +2674,12 @@ function Publish-CodexStateNotification {
     })
     $config = Get-BridgeConfig
     if (-not [bool]$config.notifications_enabled) { return [pscustomobject]@{ skipped = $true } }
+    $sourceEventAt = if (Test-BridgeProperty -Object $HookEvent -Name 'event_at') { [string]$HookEvent.event_at } else { '' }
+    if (-not (Test-BridgeNotificationAfterReset -Timestamp $sourceEventAt)) {
+        Register-CodexNotificationKey -SessionId $sessionId -TurnId $notificationTurnId -State suppressed | Out-Null
+        Write-BridgeLog -Level INFO -Message "Notification reset suppressed pre-cutoff state event $sessionId/$notificationTurnId."
+        return [pscustomobject]@{ suppressed = $true; reset = $true }
+    }
     if (-not (Register-CodexNotificationKey -SessionId $sessionId -TurnId $notificationTurnId -State reserved)) {
         return [pscustomobject]@{ skipped = $true; duplicate = $true }
     }
@@ -1792,6 +2699,7 @@ function Publish-CodexStateNotification {
         wechat_message_id = $null
         next_attachment_index = 0
         format_version = 5
+        source_event_at = $sourceEventAt
         created_at = [DateTimeOffset]::Now.ToString('o')
     }
     try {
@@ -3470,6 +4378,29 @@ function Initialize-CodexRolloutMonitorState {
     return (Read-BridgeJson -Path $StatePath -Default $state -AsHashtable)
 }
 
+function Sync-CodexRolloutMonitorNotificationReset {
+    param([Parameter(Mandatory)][Collections.IDictionary]$State)
+    $reset = Get-BridgeNotificationResetState
+    if (-not $reset -or -not (Test-BridgeProperty -Object $reset -Name 'reset_id') -or
+        [string]::IsNullOrWhiteSpace([string]$reset.reset_id)) { return $false }
+    if ($State.Contains('notification_reset_id') -and
+        [string]$State.notification_reset_id -eq [string]$reset.reset_id) { return $false }
+
+    foreach ($entry in @($State.files.GetEnumerator())) {
+        $path = [string]$entry.Key
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+        $tracked = $entry.Value
+        $tracked.offset = [long](Get-Item -LiteralPath $path).Length
+        $tracked.carry = ''
+        if ($tracked.Contains('fork_replay_from_zero')) { $tracked.fork_replay_from_zero = $false }
+    }
+    $State.notification_reset_id = [string]$reset.reset_id
+    $State.notification_reset_at = [string]$reset.cutoff_at
+    $State.initialized_at = [string]$reset.cutoff_at
+    Write-BridgeLog -Level INFO -Message "Completion monitor advanced all tracked rollout cursors for notification reset $([string]$reset.reset_id)."
+    return $true
+}
+
 function Invoke-CodexRolloutMonitorScan {
     param([Parameter(Mandatory)][string]$StatePath)
     $state = Read-BridgeJson -Path $StatePath -Default $null -AsHashtable
@@ -3496,6 +4427,7 @@ function Invoke-CodexRolloutMonitorScan {
     $missingForkBaselineEventsSkipped = 0
     $forkSourceTurnIds = @{}
     $changed = $false
+    if (Sync-CodexRolloutMonitorNotificationReset -State $state) { $changed = $true }
     foreach ($file in (Get-ChildItem -LiteralPath $sessionsRoot -Recurse -File -Filter 'rollout-*.jsonl' -ErrorAction SilentlyContinue)) {
         $sessionId = Get-CodexSessionIdFromRolloutPath -Path $file.FullName
         if (-not $sessionId) { continue }
@@ -3664,14 +4596,9 @@ function Invoke-CodexRolloutMonitorScan {
                         $reason = [string]$lifecycle.hook_event.abort_reason
                         if ($reason) { "本轮异常结束：$reason" } else { '本轮未正常完成。' }
                     }
-                    $eventAt = [DateTimeOffset]::MinValue
                     $eventAtText = [string]$lifecycle.hook_event.event_at
-                    $eventTimeValid = -not [string]::IsNullOrWhiteSpace($eventAtText) -and
-                        [DateTimeOffset]::TryParse($eventAtText, [ref]$eventAt)
-                    if ($eventTimeValid -and $eventAtText -notmatch '(?i)(?:z|[+-]\d{2}:?\d{2})$') {
-                        $unspecifiedUtc = [DateTime]::SpecifyKind($eventAt.DateTime, [DateTimeKind]::Unspecified)
-                        $eventAt = [DateTimeOffset]::new($unspecifiedUtc, [TimeSpan]::Zero)
-                    }
+                    $eventAt = ConvertTo-BridgeEventTime -Timestamp $eventAtText
+                    $eventTimeValid = $null -ne $eventAt
                     Complete-CodexRelayRecordsForThread -SessionId $sessionId -TerminalState $terminalState `
                         -TurnId ([string]$lifecycle.hook_event.turn_id) `
                         -CompletedAt $(if ($eventTimeValid) { $eventAt.ToString('o') } else { '' }) | Out-Null
@@ -4578,19 +5505,117 @@ Codex 微信双向命令：
 引用状态通知          引用桥接通知，再输入内容以继续原任务
 /新建 <任务>          新建无项目桌面对话；无需引用
 /分支 [任务]          复制被引用对话，在同一目录继续
+/附件                 引用任务通知，查看附件发送状态
+/附件 重试            立即重试该任务未发送的附件
+/附件 <序号>          发送该任务识别到的指定附件
+/附件 全部            把超过自动上限的附件也加入队列
 /状态                 查看任务状态和阶段性进展
 /状态 最近            查看最近任务
 /状态 完整            查看最近任务及结果摘要
 /桥接状态             查看微信桥接器状态
 /诊断                 诊断后台服务、Codex 与队列
+/清空                 归档全部未发送内容，并从当前时刻重新开始
 /刷新                 刷新微信上下文并补发通知
 /在线                 检查桥接是否在线
 /帮助                 显示本帮助
 
-英文旧命令仍兼容：/new、/fork、/tasks、/status、/doctor、/refresh、/ping、/help。
+英文旧命令仍兼容：/new、/fork、/tasks、/status、/doctor、/clear、/refresh、/ping、/help。
 
-安全规则：普通微信消息不会执行；继续和/分支必须引用桥接状态通知，只有/新建可不引用。仅扫码绑定的微信用户可用。
+安全规则：普通微信消息不会执行；继续、/分支和/附件必须引用桥接状态通知，/新建和/清空无需引用。/清空不停止 Codex 任务，也不删除本地文件。仅扫码绑定的微信用户可用。
 '@.Trim()
+}
+
+function Get-BridgeAttachmentStatusText {
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$SessionId,
+        [string]$TurnId,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ThreadName
+    )
+    $catalogMatch = @(Get-BridgeAttachmentCatalog -SessionId $SessionId -TurnId $TurnId)
+    $records = @(Get-BridgeAttachmentQueueRecords -SessionId $SessionId -TurnId $TurnId -State all)
+    $queued = @($records | Where-Object { $_.folder -eq 'attachment-outbox' }).Count
+    $sent = @($records | Where-Object { $_.folder -eq 'attachment-sent' }).Count
+    $failed = @($records | Where-Object { $_.folder -eq 'attachment-failed' }).Count
+    if ($catalogMatch.Count -eq 0 -and $records.Count -eq 0) {
+        return "【附件】$ThreadName`n没有找到本轮可发送的附件记录。只会识别最终回复中明确列出的文件。"
+    }
+    $catalog = if ($catalogMatch.Count -gt 0) { $catalogMatch[0].record } else { $null }
+    $recognized = if ($catalog) { [int]$catalog.recognized } else { $records.Count }
+    $excluded = if ($catalog) { @($catalog.filtered).Count + @($catalog.oversized).Count } else { 0 }
+    $overLimit = if ($catalog) { @($catalog.over_limit).Count } else { 0 }
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add("【附件】$ThreadName")
+    $lines.Add("识别 $recognized 个；已发送 $sent 个；等待/重试 $queued 个；失败 $failed 个；已排除 $excluded 个；超出自动上限 $overLimit 个。")
+    $index = 0
+    if ($catalog) {
+        foreach ($item in @($catalog.eligible) + @($catalog.over_limit)) {
+            if (-not (Test-BridgeAttachmentExtensionAllowed -Path ([string]$item.path))) { continue }
+            $index++
+            $lines.Add("$index. $([string]$item.name)")
+        }
+    }
+    if ($overLimit -gt 0) { $lines.Add('引用本通知发送 /附件 全部，可把超限附件加入队列。') }
+    if ($queued -gt 0 -or $failed -gt 0) { $lines.Add('引用本通知发送 /附件 重试，可立即重试未发送附件。') }
+    return $lines -join "`n"
+}
+
+function Invoke-BridgeAttachmentCommand {
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$CommandText,
+        [Parameter(Mandatory)]$Route
+    )
+    $catalogMatch = @(Get-BridgeAttachmentCatalog -SessionId ([string]$Route.session_id) -TurnId ([string]$Route.turn_id))
+    $catalog = if ($catalogMatch.Count -gt 0) { $catalogMatch[0].record } else { $null }
+    $argument = ([regex]::Replace($CommandText.Trim(), '^/(?:附件|attachments?)\s*', '', 'IgnoreCase')).Trim()
+    if ([string]::IsNullOrWhiteSpace($argument)) {
+        return Get-BridgeAttachmentStatusText -SessionId ([string]$Route.session_id) `
+            -TurnId ([string]$Route.turn_id) -ThreadName ([string]$Route.thread_name)
+    }
+    if ($argument -in @('重试', 'retry')) {
+        foreach ($entry in @(Get-BridgeAttachmentQueueRecords -SessionId ([string]$Route.session_id) `
+            -TurnId ([string]$Route.turn_id) -State queued)) {
+            $entry.record.next_attempt_at = [DateTimeOffset]::Now.ToString('o')
+            $entry.record.updated_at = $entry.record.next_attempt_at
+            Write-BridgeJsonAtomic -Path $entry.file.FullName -Value $entry.record
+        }
+        foreach ($entry in @(Get-BridgeAttachmentQueueRecords -SessionId ([string]$Route.session_id) `
+            -TurnId ([string]$Route.turn_id) -State failed)) {
+            if (-not (Test-BridgeAttachmentExtensionAllowed -Path ([string]$entry.record.path))) { continue }
+            $entry.record.state = 'queued'
+            $entry.record.next_attempt_at = [DateTimeOffset]::Now.ToString('o')
+            $entry.record.updated_at = $entry.record.next_attempt_at
+            $destination = Join-Path (Join-Path (Initialize-BridgeState) 'attachment-outbox') $entry.file.Name
+            Write-BridgeJsonAtomic -Path $destination -Value $entry.record
+            Remove-Item -LiteralPath $entry.file.FullName -Force -ErrorAction SilentlyContinue
+        }
+        $flush = Flush-BridgeAttachmentOutbox
+        return "【附件】$([string]$Route.thread_name)`n已启动重试：本轮尝试 $($flush.attempted) 个，发送成功 $($flush.sent) 个，继续等待 $($flush.deferred) 个，永久失败 $($flush.failed) 个。"
+    }
+    if (-not $catalog) { return "【附件】$([string]$Route.thread_name)`n没有找到可重新加入队列的附件清单。" }
+    $available = @(@($catalog.eligible) + @($catalog.over_limit) | Where-Object {
+        Test-BridgeAttachmentExtensionAllowed -Path ([string]$_.path)
+    })
+    $selected = if ($argument -in @('全部', 'all')) {
+        @($catalog.over_limit | Where-Object { Test-BridgeAttachmentExtensionAllowed -Path ([string]$_.path) })
+    } elseif ($argument -match '^\d+$') {
+        $index = [int]$argument - 1
+        if ($index -ge 0 -and $index -lt $available.Count) { @($available[$index]) } else { @() }
+    } else { @() }
+    if ($argument -in @('全部', 'all') -and $selected.Count -gt 0) {
+        $config = Get-BridgeConfig
+        $maxBytes = [long]$config.completion_attachment_max_bytes
+        $selected = @($selected | Where-Object {
+            [long]$_.bytes -le $maxBytes -and (Test-Path -LiteralPath ([string]$_.path) -PathType Leaf)
+        } | Select-Object -First 40)
+    }
+    if ($selected.Count -eq 0) {
+        return "【附件】$([string]$Route.thread_name)`n没有匹配的附件。请先发送 /附件 查看序号。"
+    }
+    $result = Add-BridgeAttachmentQueueRecords -SessionId ([string]$Route.session_id) `
+        -TurnId ([string]$Route.turn_id) -ThreadName ([string]$Route.thread_name) -Cwd ([string]$Route.cwd) `
+        -Attachments $selected -Source 'wechat_attachment_command'
+    Flush-BridgeAttachmentOutbox | Out-Null
+    return "【附件】$([string]$Route.thread_name)`n已加入队列 $($result.queued) 个，已存在或已发送 $($result.duplicates) 个。"
 }
 
 function Complete-BridgeMaintenanceCommand {
@@ -4618,6 +5643,15 @@ function Invoke-BridgeInboundCommand {
     $config = Get-BridgeConfig
     $trimmed = $Text.Trim()
     $prefix = [string]$config.relay_command_prefix
+
+    if ($trimmed -in @('/清空', '/clear')) {
+        $cleared = Clear-CodexWeChatNotificationBacklog
+        $reply = "【已清空】`n已归档未发送通知 $($cleared.text_archived) 条、附件 $($cleared.attachments_archived) 个。`n从现在开始只发送新完成内容。Codex 任务没有停止，本地文件没有删除。"
+        $delivery = Send-BridgeText -Text $reply -TimeoutSeconds 15
+        Complete-BridgeMaintenanceCommand -SavedMessage $SavedMessage -Command 'clear' `
+            -ReplyText $reply -ReplyMessageId ([string]$delivery.message_id)
+        return
+    }
 
     if ($trimmed -in @('/刷新', '/refresh', '刷新通知', '恢复通知', '补发通知')) {
         Update-InboundRecord -Path ([string]$SavedMessage.path) -Changes @{
@@ -4647,7 +5681,8 @@ function Invoke-BridgeInboundCommand {
         $executionRule = if ([bool]$status.require_completion_quote) {
             '引用续接和分支已启用；新建无需引用'
         } else { '允许直接执行' }
-        $reply = "微信桥接在线。`n版本：$script:BridgeVersion`n模式：$modeText`n执行：$executionRule`n通知：$deliveryText`n待选择对话：$($status.reply_pending_count)`n待执行：$($status.relay_queued_count)`n执行中：$($status.relay_running_count)"
+        $resetText = if ($status.notification_reset_at) { "`n最近清空：$($status.notification_reset_at)" } else { '' }
+        $reply = "微信桥接在线。`n版本：$script:BridgeVersion`n模式：$modeText`n执行：$executionRule`n通知：$deliveryText$resetText`n待选择对话：$($status.reply_pending_count)`n待执行：$($status.relay_queued_count)`n执行中：$($status.relay_running_count)"
         $delivery = Send-BridgeText -Text $reply -TimeoutSeconds 10
         Complete-BridgeMaintenanceCommand -SavedMessage $SavedMessage -Command 'status' `
             -ReplyText $reply -ReplyMessageId ([string]$delivery.message_id)
@@ -4697,6 +5732,36 @@ function Invoke-BridgeInboundCommand {
     $hasCompletionQuote = ($referenceMessageIds.Count -gt 0) -or
         (-not [string]::IsNullOrWhiteSpace($referenceText) -and
             [regex]::IsMatch($referenceText, '【(?:已完成|已暂停|执行失败|已创建)】[^\r\n]+'))
+
+    $looksLikeAttachmentCommand = [regex]::IsMatch($trimmed, '^/(?:附件|attachments?)(?:\s|$)', 'IgnoreCase')
+    if ($looksLikeAttachmentCommand) {
+        if (-not $hasCompletionQuote) {
+            Update-InboundRecord -Path ([string]$SavedMessage.path) -Changes @{
+                relay_state = 'not_executed_unquoted_attachment'
+                relay_prompt = $trimmed
+            } | Out-Null
+            Send-BridgeText -Text '未执行：/附件必须引用对应任务的【已完成】通知。' -TimeoutSeconds 10 | Out-Null
+            return
+        }
+        $attachmentRoute = Resolve-BridgeReplyTarget -ReferenceText $referenceText `
+            -ReferenceMessageIds $referenceMessageIds -ReferenceCreateTimeMs $referenceCreateTimeMs `
+            -InboundMessageId ([string]$SavedMessage.record.id) -InboundCreateTimeMs ([long]$SavedMessage.record.create_time_ms) `
+            -RequireQuotedReference
+        if (-not $attachmentRoute.resolved) {
+            Update-InboundRecord -Path ([string]$SavedMessage.path) -Changes @{
+                relay_state = 'not_executed_attachment_target_not_found'
+                relay_prompt = $trimmed
+            } | Out-Null
+            Send-BridgeText -Text '未执行：没有从引用内容中找到对应的附件任务。请直接引用桥接发送的完整【已完成】通知后重试。' `
+                -TimeoutSeconds 10 | Out-Null
+            return
+        }
+        $reply = Invoke-BridgeAttachmentCommand -CommandText $trimmed -Route $attachmentRoute
+        $delivery = Send-BridgeText -Text $reply -TimeoutSeconds 15
+        Complete-BridgeMaintenanceCommand -SavedMessage $SavedMessage -Command 'attachments' `
+            -ReplyText $reply -ReplyMessageId ([string]$delivery.message_id)
+        return
+    }
 
     $commandStart = $prefix + ' '
     $explicitCommand = $trimmed.StartsWith($commandStart, [StringComparison]::OrdinalIgnoreCase)
@@ -4852,6 +5917,110 @@ function Get-QueuedCompletionSummary {
     return $summary.Trim()
 }
 
+function Move-LegacyBridgeAttachmentsToQueue {
+    $root = Initialize-BridgeState
+    $outboxPath = Join-Path $root 'outbox'
+    $migrated = 0
+    $duplicates = 0
+    foreach ($file in @(Get-ChildItem -LiteralPath $outboxPath -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+        $message = Read-BridgeJson -Path $file.FullName -Default $null
+        if (-not $message -or [string]$message.type -ne 'codex_turn_complete') { continue }
+        $attachments = @(if ((Test-BridgeProperty -Object $message -Name 'attachments') -and $null -ne $message.attachments) {
+            @($message.attachments)
+        } else { @() })
+        if ($attachments.Count -eq 0) {
+            if ((Test-BridgeProperty -Object $message -Name 'text_sent') -and [bool]$message.text_sent) {
+                Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+            }
+            continue
+        }
+        $nextIndex = if (Test-BridgeProperty -Object $message -Name 'next_attachment_index') {
+            [Math]::Max(0, [int]$message.next_attachment_index)
+        } else { 0 }
+        $remaining = @($attachments | Select-Object -Skip $nextIndex)
+        if ($remaining.Count -gt 0 -and $message.session_id -and $message.turn_id) {
+            $result = Add-BridgeAttachmentQueueRecords -SessionId ([string]$message.session_id) `
+                -TurnId ([string]$message.turn_id) -ThreadName ([string]$message.thread_name) `
+                -Cwd ([string]$message.cwd) -Attachments $remaining -Source 'v0923_active_outbox_migration'
+            $migrated += [int]$result.queued
+            $duplicates += [int]$result.duplicates
+        }
+        $message.attachments = @()
+        if (Test-BridgeProperty -Object $message -Name 'next_attachment_index') { $message.next_attachment_index = 0 }
+        if (Test-BridgeProperty -Object $message -Name 'format_version') { $message.format_version = 7 }
+        else { $message | Add-Member -NotePropertyName format_version -NotePropertyValue 7 }
+        Write-BridgeJsonAtomic -Path $file.FullName -Value $message
+        if ((Test-BridgeProperty -Object $message -Name 'text_sent') -and [bool]$message.text_sent) {
+            Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if ($migrated -gt 0 -or $duplicates -gt 0) {
+        Write-BridgeLog -Level INFO -Message "Migrated active legacy attachments: queued=$migrated, duplicates=$duplicates. Superseded history was not touched."
+    }
+    return [pscustomobject]@{ migrated = $migrated; duplicates = $duplicates }
+}
+
+function Flush-BridgeAttachmentOutbox {
+    return Invoke-WithBridgeNotificationGate -Action { Invoke-BridgeAttachmentOutboxFlushCore }
+}
+
+function Invoke-BridgeAttachmentOutboxFlushCore {
+    $root = Initialize-BridgeState
+    Move-BridgeQueuedRecordsAtOrBeforeReset -Queue 'attachment-outbox' | Out-Null
+    Remove-BridgeDisallowedQueuedAttachments | Out-Null
+    $config = Get-BridgeConfig
+    $budget = [Math]::Max(1, [int]$config.completion_attachment_send_batch_size)
+    $now = [DateTimeOffset]::Now
+    $due = @(Get-BridgeAttachmentQueueRecords -State queued | Where-Object {
+        $nextAt = [DateTimeOffset]::MinValue
+        -not (Test-BridgeProperty -Object $_.record -Name 'next_attempt_at') -or
+        [string]::IsNullOrWhiteSpace([string]$_.record.next_attempt_at) -or
+        -not [DateTimeOffset]::TryParse([string]$_.record.next_attempt_at, [ref]$nextAt) -or
+        $nextAt -le $now
+    } | Sort-Object { [DateTimeOffset]$_.record.next_attempt_at }, { [DateTimeOffset]$_.record.created_at })
+    $attempted = 0
+    $sent = 0
+    $deferred = 0
+    $failed = 0
+    foreach ($entry in $due) {
+        if ($attempted -ge $budget) { break }
+        $attempted++
+        $record = $entry.record
+        $attempt = if (Test-BridgeProperty -Object $record -Name 'attempts') { [int]$record.attempts + 1 } else { 1 }
+        $record.attempts = $attempt
+        $record.last_attempt_at = [DateTimeOffset]::Now.ToString('o')
+        $record.updated_at = $record.last_attempt_at
+        try {
+            Send-BridgeFile -Path ([string]$record.path) -AllowContextlessRetry -TimeoutSeconds 90 | Out-Null
+            if (Test-BridgeProperty -Object $record -Name 'sent_at') { $record.sent_at = [DateTimeOffset]::Now.ToString('o') }
+            else { $record | Add-Member -NotePropertyName sent_at -NotePropertyValue ([DateTimeOffset]::Now.ToString('o')) }
+            $record.last_error = $null
+            Move-BridgeAttachmentQueueRecord -Path $entry.file.FullName -State sent -Record $record | Out-Null
+            $sent++
+        } catch {
+            $errorMessage = $_.Exception.Message
+            if ($errorMessage.Length -gt 800) { $errorMessage = $errorMessage.Substring(0, 800) + '…' }
+            $record.last_error = $errorMessage
+            if (Test-BridgeAttachmentPermanentError -Message $errorMessage) {
+                if (Test-BridgeProperty -Object $record -Name 'failed_at') { $record.failed_at = [DateTimeOffset]::Now.ToString('o') }
+                else { $record | Add-Member -NotePropertyName failed_at -NotePropertyValue ([DateTimeOffset]::Now.ToString('o')) }
+                Move-BridgeAttachmentQueueRecord -Path $entry.file.FullName -State failed -Record $record | Out-Null
+                $failed++
+                Write-BridgeLog -Level WARN -Message "Attachment permanently failed and was isolated: $([string]$record.name): $errorMessage"
+            } else {
+                $delay = Get-BridgeAttachmentRetryDelaySeconds -Attempt $attempt
+                $record.next_attempt_at = [DateTimeOffset]::Now.AddSeconds($delay).ToString('o')
+                Write-BridgeJsonAtomic -Path $entry.file.FullName -Value $record
+                $deferred++
+                Write-BridgeLog -Level WARN -Message "Attachment retry scheduled in ${delay}s: $([string]$record.name): $errorMessage"
+            }
+            # Continue with other due files. One failed CDN upload must not block
+            # attachments belonging to other turns or conversations.
+        }
+    }
+    return [pscustomobject]@{ attempted = $attempted; sent = $sent; deferred = $deferred; failed = $failed }
+}
+
 function Compact-BridgeOutbox {
     $root = Initialize-BridgeState
     $outboxPath = Join-Path $root 'outbox'
@@ -4873,7 +6042,13 @@ function Compact-BridgeOutbox {
             $name = [string]$latest.message.thread_name
         }
         $summary = Get-QueuedCompletionSummary -Message $latest.message
-        $latest.message.text = Format-CodexCompletionText -Name $name -Summary $summary
+        $config = Get-BridgeConfig
+        $chunkChars = if ($config.completion_text_chunk_chars) { [int]$config.completion_text_chunk_chars } else { 1100 }
+        $maxChunks = if ($config.completion_text_max_chunks) { [int]$config.completion_text_max_chunks } else { 6 }
+        $textBundle = New-CodexCompletionTextBundle -Name $name -Summary $summary `
+            -ChunkChars $chunkChars -MaxChunks $maxChunks
+        $summary = [string]$textBundle.summary
+        $latest.message.text = [string]$textBundle.parts[0]
         if (Test-BridgeProperty -Object $latest.message -Name 'thread_name') { $latest.message.thread_name = $name }
         else { $latest.message | Add-Member -NotePropertyName thread_name -NotePropertyValue $name }
         if (Test-BridgeProperty -Object $latest.message -Name 'summary') { $latest.message.summary = $summary }
@@ -4884,14 +6059,25 @@ function Compact-BridgeOutbox {
         if (-not (Test-BridgeProperty -Object $latest.message -Name 'text_sent')) {
             $latest.message | Add-Member -NotePropertyName text_sent -NotePropertyValue $false
         }
+        if (-not (Test-BridgeProperty -Object $latest.message -Name 'next_text_index')) {
+            $latest.message | Add-Member -NotePropertyName next_text_index -NotePropertyValue 0
+        }
+        if (-not (Test-BridgeProperty -Object $latest.message -Name 'text_parts')) {
+            $latest.message | Add-Member -NotePropertyName text_parts -NotePropertyValue @($textBundle.parts)
+        } elseif (-not [bool]$latest.message.text_sent -and [int]$latest.message.next_text_index -eq 0) {
+            $latest.message.text_parts = @($textBundle.parts)
+        }
+        if (-not (Test-BridgeProperty -Object $latest.message -Name 'wechat_message_ids')) {
+            $latest.message | Add-Member -NotePropertyName wechat_message_ids -NotePropertyValue @()
+        }
         if (-not (Test-BridgeProperty -Object $latest.message -Name 'wechat_message_id')) {
             $latest.message | Add-Member -NotePropertyName wechat_message_id -NotePropertyValue $null
         }
         if (-not (Test-BridgeProperty -Object $latest.message -Name 'next_attachment_index')) {
             $latest.message | Add-Member -NotePropertyName next_attachment_index -NotePropertyValue 0
         }
-        if (Test-BridgeProperty -Object $latest.message -Name 'format_version') { $latest.message.format_version = 4 }
-        else { $latest.message | Add-Member -NotePropertyName format_version -NotePropertyValue 4 }
+        if (Test-BridgeProperty -Object $latest.message -Name 'format_version') { $latest.message.format_version = 7 }
+        else { $latest.message | Add-Member -NotePropertyName format_version -NotePropertyValue 7 }
         Write-BridgeJsonAtomic -Path $latest.file.FullName -Value $latest.message
 
         foreach ($superseded in @($ordered | Select-Object -Skip 1)) {
@@ -4906,7 +6092,17 @@ function Compact-BridgeOutbox {
 }
 
 function Flush-BridgeOutbox {
+    return Invoke-WithBridgeNotificationGate -Action { Invoke-BridgeOutboxFlushCore }
+}
+
+function Invoke-BridgeOutboxFlushCore {
     $root = Initialize-BridgeState
+    Move-BridgeQueuedRecordsAtOrBeforeReset -Queue 'all' | Out-Null
+    Move-LegacyBridgeAttachmentsToQueue | Out-Null
+    # Local policy cleanup must run even when WeChat delivery is paused for a
+    # missing context token. Disallowed files must never remain sendable while
+    # the bridge waits for a future inbound message.
+    Remove-BridgeDisallowedQueuedAttachments | Out-Null
     Compact-BridgeOutbox
     $delivery = Get-BridgeDeliveryState
     if ([string]$delivery.state -eq 'waiting_for_wechat' -and
@@ -4917,7 +6113,7 @@ function Flush-BridgeOutbox {
     $allFiles = @(Get-ChildItem -LiteralPath $outboxPath -Filter '*.json' -File | Sort-Object Name)
     $files = @($allFiles | Where-Object {
         $candidate = Read-BridgeJson -Path $_.FullName -Default $null
-        $candidate -and $candidate.text -and -not (
+        $candidate -and ($candidate.text -or $candidate.text_parts) -and -not (
             (Test-BridgeProperty -Object $candidate -Name 'text_sent') -and [bool]$candidate.text_sent
         )
     } | Select-Object -First $batchSize)
@@ -4926,22 +6122,44 @@ function Flush-BridgeOutbox {
     # A large or rejected attachment must never block later task notifications.
     foreach ($file in $files) {
         $message = Read-BridgeJson -Path $file.FullName -Default $null
-        if (-not $message -or -not $message.text) { continue }
+        if (-not $message -or (-not $message.text -and -not $message.text_parts)) { continue }
         $textSent = (Test-BridgeProperty -Object $message -Name 'text_sent') -and [bool]$message.text_sent
         if ($textSent) { continue }
         try {
-            $textDelivery = Send-BridgeRoutableText -Text ([string]$message.text) -AllowContextlessRetry -TimeoutSeconds 15
+            $textParts = @(if ((Test-BridgeProperty -Object $message -Name 'text_parts') -and $null -ne $message.text_parts) {
+                @($message.text_parts)
+            } else { @([string]$message.text) })
+            $nextTextIndex = if (Test-BridgeProperty -Object $message -Name 'next_text_index') {
+                [int]$message.next_text_index
+            } else { 0 }
+            if (-not (Test-BridgeProperty -Object $message -Name 'wechat_message_ids')) {
+                $message | Add-Member -NotePropertyName wechat_message_ids -NotePropertyValue @()
+            }
+            while ($nextTextIndex -lt $textParts.Count) {
+                $textDelivery = Send-BridgeRoutableText -Text ([string]$textParts[$nextTextIndex]) `
+                    -AllowContextlessRetry -TimeoutSeconds 15
+                $nextTextIndex++
+                if (Test-BridgeProperty -Object $message -Name 'next_text_index') {
+                    $message.next_text_index = $nextTextIndex
+                } else {
+                    $message | Add-Member -NotePropertyName next_text_index -NotePropertyValue $nextTextIndex
+                }
+                $message.wechat_message_ids = @($message.wechat_message_ids) + [string]$textDelivery.message_id
+                if (Test-BridgeProperty -Object $message -Name 'wechat_message_id') {
+                    $message.wechat_message_id = [string]$textDelivery.message_id
+                } else {
+                    $message | Add-Member -NotePropertyName wechat_message_id -NotePropertyValue ([string]$textDelivery.message_id)
+                }
+                Register-BridgeReplyTarget -SessionId ([string]$message.session_id) `
+                    -ThreadName ([string]$message.thread_name) -Cwd ([string]$message.cwd) `
+                    -TurnId ([string]$message.turn_id) -WeChatMessageId ([string]$textDelivery.message_id) `
+                    -SendStartedAt ([string]$textDelivery.send_started_at) -SendCompletedAt ([string]$textDelivery.send_completed_at)
+                # Checkpoint each successful part. A transient failure resumes
+                # from the next part instead of replaying the beginning.
+                Write-BridgeJsonAtomic -Path $file.FullName -Value $message
+            }
             if (Test-BridgeProperty -Object $message -Name 'text_sent') { $message.text_sent = $true }
             else { $message | Add-Member -NotePropertyName text_sent -NotePropertyValue $true }
-            if (Test-BridgeProperty -Object $message -Name 'wechat_message_id') {
-                $message.wechat_message_id = [string]$textDelivery.message_id
-            } else {
-                $message | Add-Member -NotePropertyName wechat_message_id -NotePropertyValue ([string]$textDelivery.message_id)
-            }
-            Register-BridgeReplyTarget -SessionId ([string]$message.session_id) `
-                -ThreadName ([string]$message.thread_name) -Cwd ([string]$message.cwd) `
-                -TurnId ([string]$message.turn_id) -WeChatMessageId ([string]$textDelivery.message_id) `
-                -SendStartedAt ([string]$textDelivery.send_started_at) -SendCompletedAt ([string]$textDelivery.send_completed_at)
             Write-BridgeJsonAtomic -Path $file.FullName -Value $message
             if ($message.session_id -and $message.turn_id) {
                 Set-CodexNotificationState -SessionId ([string]$message.session_id) `
@@ -4965,45 +6183,8 @@ function Flush-BridgeOutbox {
     $delivery = Get-BridgeDeliveryState
     if ([string]$delivery.state -eq 'waiting_for_wechat') { return }
 
-    # Pass 2: send at most one attachment per poll. Texts are already checkpointed,
-    # so attachment quota/errors cannot suppress another task's completion text.
-    $attachmentBudget = 1
-    $files = Get-ChildItem -LiteralPath $outboxPath -Filter '*.json' -File |
-        Sort-Object Name | Select-Object -First $batchSize
-    foreach ($file in $files) {
-        if ($attachmentBudget -le 0) { break }
-        $message = Read-BridgeJson -Path $file.FullName -Default $null
-        if (-not $message -or -not $message.text) { continue }
-        $textSent = (Test-BridgeProperty -Object $message -Name 'text_sent') -and [bool]$message.text_sent
-        if (-not $textSent) { continue }
-        $attachments = @(if ((Test-BridgeProperty -Object $message -Name 'attachments') -and $null -ne $message.attachments) {
-            @($message.attachments)
-        } else { @() })
-        $nextIndex = if (Test-BridgeProperty -Object $message -Name 'next_attachment_index') { [int]$message.next_attachment_index } else { 0 }
-        if ($nextIndex -ge $attachments.Count) {
-            Remove-Item -LiteralPath $file.FullName -Force
-            continue
-        }
-        try {
-            $attachmentPath = if ($attachments[$nextIndex] -is [string]) {
-                [string]$attachments[$nextIndex]
-            } else { [string]$attachments[$nextIndex].path }
-            Send-BridgeFile -Path $attachmentPath -AllowContextlessRetry -TimeoutSeconds 90 | Out-Null
-            if (Test-BridgeProperty -Object $message -Name 'next_attachment_index') { $message.next_attachment_index = $nextIndex + 1 }
-            else { $message | Add-Member -NotePropertyName next_attachment_index -NotePropertyValue ($nextIndex + 1) }
-            Write-BridgeJsonAtomic -Path $file.FullName -Value $message
-            $attachmentBudget--
-            if ([int]$message.next_attachment_index -ge $attachments.Count) {
-                Remove-Item -LiteralPath $file.FullName -Force
-            }
-        } catch {
-            $delivery = Get-BridgeDeliveryState
-            if ([string]$delivery.state -ne 'waiting_for_wechat') {
-                Write-BridgeLog -Level WARN -Message "Outbox attachment delivery deferred: $($_.Exception.Message)"
-            }
-            break
-        }
-    }
+    Flush-BridgeAttachmentOutbox | Out-Null
+    Publish-BridgeCompletedAttachmentSummaries
 }
 
 function Invoke-BridgePollOnce {
@@ -5014,18 +6195,27 @@ function Invoke-BridgePollOnce {
     if (-not $token) { throw 'WeChat bridge is not logged in.' }
     $script:BridgeOutboxFlushedThisPoll = $false
     $syncPath = Join-Path $root 'sync.json'
-    $sync = Read-BridgeJson -Path $syncPath -Default ([pscustomobject]@{ get_updates_buf = '' })
+    $sync = Get-BridgeSyncState -Path $syncPath
+    if (-not [bool]$sync.valid) {
+        $repair = Repair-BridgeSyncCursor -Path $syncPath -BaseUrl ([string]$config.base_url) `
+            -Token $token -TimeoutSeconds $TimeoutSeconds
+        if (-not $script:BridgeOutboxFlushedThisPoll) { Flush-BridgeOutbox }
+        return [pscustomobject]@{
+            sync_recovered = [bool]$repair.recovered
+            discarded_message_count = [int]$repair.discarded_message_count
+            get_updates_buf = [string]$repair.cursor
+            msgs = @()
+        }
+    }
     $response = Invoke-IlinkRequest -BaseUrl ([string]$config.base_url) -Endpoint 'ilink/bot/getupdates' `
-        -Method POST -Body @{ get_updates_buf = [string]$sync.get_updates_buf; base_info = Get-BridgeBaseInfo } `
+        -Method POST -Body @{ get_updates_buf = [string]$sync.cursor; base_info = Get-BridgeBaseInfo } `
         -Token $token -TimeoutSeconds $TimeoutSeconds
 
     $errcode = if ($response.PSObject.Properties.Name -contains 'errcode') { [int]$response.errcode } else { 0 }
     if ($errcode -ne 0) {
         throw "WeChat getUpdates failed with errcode=$errcode."
     }
-    if ($response.PSObject.Properties.Name -contains 'get_updates_buf' -and $null -ne $response.get_updates_buf) {
-        Write-BridgeJsonAtomic -Path $syncPath -Value @{ get_updates_buf = [string]$response.get_updates_buf }
-    }
+    Save-BridgeSyncCursorFromResponse -Path $syncPath -Response $response | Out-Null
 
     $messages = @(if ($response.PSObject.Properties.Name -contains 'msgs') { @($response.msgs) })
     foreach ($message in $messages) {
@@ -5097,14 +6287,38 @@ function Start-CodexWeChatBridgeMonitor {
                 Write-BridgeLog -Level WARN -Message "Relay worker start failed: $($_.Exception.Message)"
             }
         }
+        $consecutiveFailures = 0
+        $lastLoggedError = ''
+        $lastErrorLoggedAt = [DateTimeOffset]::MinValue
         do {
             try {
                 Invoke-BridgePollOnce -TimeoutSeconds 40 | Out-Null
-                Save-BridgeStatus -State 'monitor_running' -Detail 'Long-poll monitor is active' -Extra @{ pid = $PID }
+                if ($consecutiveFailures -gt 0) {
+                    Write-BridgeLog -Level INFO -Message "Monitor recovered after $consecutiveFailures consecutive failure(s)."
+                }
+                $consecutiveFailures = 0
+                $lastLoggedError = ''
+                $lastErrorLoggedAt = [DateTimeOffset]::MinValue
+                Save-BridgeStatus -State 'monitor_running' -Detail 'Long-poll monitor is active' -Extra @{
+                    pid = $PID
+                    consecutive_failures = 0
+                }
             } catch {
-                Save-BridgeStatus -State 'monitor_retrying' -Detail $_.Exception.Message -Extra @{ pid = $PID }
-                Write-BridgeLog -Level WARN -Message "Monitor retry: $($_.Exception.Message)"
-                Start-Sleep -Seconds 3
+                $consecutiveFailures++
+                $errorMessage = ([string]$_.Exception.Message -replace '\s+', ' ').Trim()
+                $retryDelay = [Math]::Min(30, 3 * [Math]::Pow(2, [Math]::Min(4, $consecutiveFailures - 1)))
+                Save-BridgeStatus -State 'monitor_retrying' -Detail $errorMessage -Extra @{
+                    pid = $PID
+                    consecutive_failures = $consecutiveFailures
+                    retry_delay_seconds = [int]$retryDelay
+                }
+                $now = [DateTimeOffset]::Now
+                if ($errorMessage -ne $lastLoggedError -or ($now - $lastErrorLoggedAt).TotalMinutes -ge 5) {
+                    Write-BridgeLog -Level WARN -Message "Monitor retry #$consecutiveFailures in $([int]$retryDelay)s: $errorMessage"
+                    $lastLoggedError = $errorMessage
+                    $lastErrorLoggedAt = $now
+                }
+                if (-not $Once) { Start-Sleep -Seconds ([int]$retryDelay) }
             }
             if ($Once) { break }
         } while (-not (Test-Path -LiteralPath $stopPath))
@@ -5133,8 +6347,14 @@ function Get-CodexWeChatBridgeStatus {
     $inboxFiles = @(Get-ChildItem -LiteralPath (Join-Path $root 'inbox') -Filter '*.json' -File -ErrorAction SilentlyContinue)
     $inboxCount = $inboxFiles.Count
     $outboxCount = @(Get-ChildItem -LiteralPath (Join-Path $root 'outbox') -Filter '*.json' -File -ErrorAction SilentlyContinue).Count
+    $attachmentQueuedCount = @(Get-ChildItem -LiteralPath (Join-Path $root 'attachment-outbox') -Filter '*.json' -File -ErrorAction SilentlyContinue).Count
+    $attachmentFailedCount = @(Get-ChildItem -LiteralPath (Join-Path $root 'attachment-failed') -Filter '*.json' -File -ErrorAction SilentlyContinue).Count
+    $attachmentSkippedCount = @(Get-ChildItem -LiteralPath (Join-Path $root 'attachment-skipped') -Filter '*.json' -File -ErrorAction SilentlyContinue).Count
     $completionStatus = Read-BridgeJson -Path (Join-Path $root 'completion-status.json') -Default ([pscustomobject]@{ state = 'not_started' })
+    $notificationReset = Get-BridgeNotificationResetState
     $deliveryStatus = Get-BridgeDeliveryState
+    $syncState = Get-BridgeSyncState -Path (Join-Path $root 'sync.json')
+    $syncRecovery = Read-BridgeJson -Path (Join-Path $root 'sync-recovery.json') -Default $null
     $replyRouting = Get-BridgeReplyRoutingState
     $relayQueuedCount = 0
     $relayRunningCount = 0
@@ -5146,6 +6366,7 @@ function Get-CodexWeChatBridgeStatus {
     }
     return [pscustomobject]@{
         bridge_version = $script:BridgeVersion
+        http_transport_mode = $script:HttpTransportMode
         state = [string]$status.state
         detail = [string]$status.detail
         logged_in = [bool](Get-BridgeSecret -Name 'bot_token')
@@ -5160,11 +6381,21 @@ function Get-CodexWeChatBridgeStatus {
         relay_transport = [string]$config.relay_transport
         inbox_count = $inboxCount
         outbox_count = $outboxCount
+        attachment_queued_count = $attachmentQueuedCount
+        attachment_failed_count = $attachmentFailedCount
+        attachment_skipped_count = $attachmentSkippedCount
         relay_queued_count = $relayQueuedCount
         relay_running_count = $relayRunningCount
         completion_monitor_state = [string]$completionStatus.state
         delivery_state = [string]$deliveryStatus.state
-        notification_pending_count = $outboxCount
+        sync_state = if ([bool]$syncState.valid) { 'healthy' } else { "repair_pending:$($syncState.reason)" }
+        sync_last_recovered_at = if ($syncRecovery -and (Test-BridgeProperty -Object $syncRecovery -Name 'recovered_at')) {
+            [string]$syncRecovery.recovered_at
+        } else { '' }
+        notification_pending_count = $outboxCount + $attachmentQueuedCount
+        notification_reset_at = if ($notificationReset -and (Test-BridgeProperty -Object $notificationReset -Name 'cutoff_at')) {
+            [string]$notificationReset.cutoff_at
+        } else { '' }
         state_root = $root
     }
 }
@@ -5212,7 +6443,9 @@ function Get-BridgeDoctorText {
         "计划任务：$taskState",
         "Codex：$(if ($codexOk) { '可用' } else { '未找到' })",
         "PowerShell 7：$(if ($pwshOk) { '可用' } else { '未找到' })",
-        "微信投递：$($status.delivery_state)（积压 $($status.notification_pending_count)）",
+        "微信网络：$($status.http_transport_mode)",
+        "微信游标：$(if ($status.sync_state -eq 'healthy') { '正常' } else { '等待自动恢复' })",
+        "微信投递：$($status.delivery_state)（文字积压 $($status.outbox_count)，附件等待 $($status.attachment_queued_count)，附件失败 $($status.attachment_failed_count)，附件跳过 $($status.attachment_skipped_count)）",
         "执行队列：等待 $($status.relay_queued_count)，执行中 $($status.relay_running_count)",
         "托管 worktree：$(@($worktreeState.worktrees).Count)"
     )
@@ -5222,6 +6455,7 @@ function Get-BridgeDoctorText {
 }
 
 Export-ModuleMember -Function @(
+    'Clear-CodexWeChatNotificationBacklog',
     'Connect-CodexWeChatBridge',
     'Disable-CodexWeChatRelay',
     'Enable-CodexWeChatRelay',

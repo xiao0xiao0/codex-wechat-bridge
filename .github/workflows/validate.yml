@@ -15,3 +15,9 @@ jobs:
       - name: Validate release structure and PowerShell syntax
         shell: pwsh
         run: ./tests/Validate-PublicRelease.ps1
+      - name: Validate WeChat sync cursor recovery
+        shell: pwsh
+        run: ./tests/Validate-SyncRecovery.ps1
+      - name: Validate fork replay guard
+        shell: pwsh
+        run: ./tests/Validate-ForkReplayGuard.ps1
