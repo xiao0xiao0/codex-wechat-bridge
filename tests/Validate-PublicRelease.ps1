@@ -13,7 +13,7 @@ foreach ($path in @($manifestPath, $marketplacePath, (Join-Path $repoRoot 'READM
 
 $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding utf8 | ConvertFrom-Json
 if ([string]$manifest.name -ne 'codex-wechat-bridge') { throw 'Unexpected plugin name.' }
-if ([string]$manifest.version -ne '0.9.22') { throw "Unexpected plugin version: $($manifest.version)" }
+if ([string]$manifest.version -ne '0.9.30') { throw "Unexpected plugin version: $($manifest.version)" }
 
 $releaseNotesPath = Join-Path $repoRoot ("docs\releases\v{0}.md" -f [string]$manifest.version)
 if (-not (Test-Path -LiteralPath $releaseNotesPath -PathType Leaf)) {
@@ -41,7 +41,7 @@ $syntaxErrors = @()
 $powerShellFiles = @(
     @(Get-ChildItem -LiteralPath (Join-Path $pluginRoot 'scripts') -File | Where-Object { $_.Extension -in @('.ps1', '.psm1') })
     Get-Item -LiteralPath (Join-Path $repoRoot 'install.ps1')
-    Get-Item -LiteralPath $PSCommandPath
+    @(Get-ChildItem -LiteralPath $PSScriptRoot -File -Filter '*.ps1')
 )
 foreach ($script in $powerShellFiles) {
     $tokens = $null

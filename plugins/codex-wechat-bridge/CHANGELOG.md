@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.9.30 - 2026-08-21
+
+- Validates the durable WeChat `sync.json` cursor before every poll. Missing, empty, NUL-filled, malformed, or structurally incomplete state now enters a fail-safe self-healing path instead of deadlocking the monitor on a missing property.
+- Quarantines an invalid cursor file, fetches a fresh server cursor with an empty baseline, and deliberately discards every message returned by that recovery request. This prevents accumulated historical commands from being replayed or executed after a long disconnect.
+- Preserves a healthy cursor across DNS, TLS, timeout, and malformed-response failures. A replacement is committed atomically only after the server returns a non-empty cursor, and recovery metadata records the reason, backup, skipped count, and a non-secret cursor fingerprint.
+- Adds exponential monitor retry backoff capped at 30 seconds, five-minute duplicate-warning suppression, and a single recovery log entry after connectivity returns. `/诊断` now reports whether the WeChat cursor is healthy or awaiting automatic repair.
+
+## 0.9.29 - 2026-08-19
+
+- Defaults the Tencent iLink and CDN transport to a direct connection, preventing local system proxies such as `127.0.0.1` from terminating WeChat TLS sessions.
+- Adds `wechat_http_proxy_mode` with `direct` (default), `system`, and `auto` modes. `CODEX_WECHAT_BRIDGE_HTTP_PROXY_MODE` can override the saved setting for troubleshooting.
+- Exposes the selected HTTP transport in bridge status and `/诊断`; normal certificate validation remains enabled.
+
+## 0.9.28 - 2026-08-19
+
+- Fixes a Windows PowerShell 7 connectivity failure where `HttpWindowsProxy` exposes no real proxy URI but still routes iLink requests through the system-proxy path, causing repeated TLS `unexpected EOF` errors.
+- The bridge now automatically uses a direct `HttpClient` connection only when Windows reports no actual proxy; explicitly configured proxies continue to use the normal system-proxy path.
+- Certificate validation remains enabled and unchanged.
+
+## 0.9.27 - 2026-08-18
+
+- Fixes a reset-watermark timezone regression in 0.9.26. PowerShell can stringify Codex's UTC rollout timestamps without the original `Z`; those unqualified lifecycle times are now normalized back to UTC before reset and freshness comparisons.
+- Applies the same normalization to late queued-record filtering and completion-monitor freshness checks, preventing genuine post-reset completions from being suppressed on UTC+8 Windows systems.
+- Adds an offline regression that places zone-less UTC events immediately before and after a reset boundary and verifies that only the pre-reset event is archived.
+
+## 0.9.26 - 2026-08-18
+
+- Adds the global `/清空` (`/clear`) command to archive every unsent text notification and attachment and resume delivery from the command's cutoff time without requiring a quoted task.
+- Writes the reset watermark before moving queue records, serializes publishers and flushers through a named notification gate, and filters any late pre-cutoff record so concurrent hooks cannot resurrect cleared history.
+- Advances every tracked Codex rollout cursor to its current end after a reset. Tasks already running continue normally and their later completion remains eligible for notification.
+- Keeps cleared queue records in a local per-reset archive; it does not stop Codex tasks, remove completed deliverables, or invalidate already-sent quoted notifications.
+
+## 0.9.25 - 2026-08-13
+
+- Removes Markdown (`.md`) from automatic and manually requested WeChat attachments. Existing user configurations are upgraded to remove `.md`, and old completion catalogs cannot re-enqueue Markdown through `/附件 <序号>` or `/附件 全部`.
+- Moves already queued but unsent disallowed attachments into `attachment-skipped/` without deleting the local files, and exposes the skipped count in bridge diagnostics.
+
+## 0.9.24 - 2026-08-13
+
+- Replaces completion-level attachment checkpoints with one durable queue record per file. A failing upload no longer blocks attachments from later tasks; transient HTTP 500, SSL, timeout, and stream-copy failures receive persisted exponential backoff from one minute to six hours.
+- Migrates only still-pending attachments from the active 0.9.23 outbox, honors the old `next_attachment_index`, and leaves superseded history untouched. New completions cannot archive an older unsent attachment, and conversation/path/size deduplication prevents the same deliverable from being resent by a later turn.
+- Raises the automatic completion attachment limit from three to ten while preserving the 100 MB per-file limit and the deliverable extension allowlist. Completion notifications disclose recognized, queued, excluded, and over-limit counts.
+- Adds quote-authorized `/附件`, `/附件 重试`, `/附件 <序号>`, and `/附件 全部` commands for exact-task status, retry, selection, and bounded recovery of over-limit deliverables. A one-time `【附件完成】` summary reports the final sent/duplicate/failed counts.
+- Extends `/诊断` and bridge status with separate completion-text, pending-attachment, and failed-attachment counts.
+
+## 0.9.23 - 2026-08-13
+
+- Splits long completion summaries into bounded, paragraph-aware WeChat messages. Every part repeats the complete `【已完成】task name` header and carries a `(part/total)` marker, so quoting any segment still routes back to the correct Codex task.
+- Checkpoints each successfully delivered text part in the durable outbox. A transient delivery failure resumes at the next segment instead of replaying the beginning, while a configurable maximum prevents unusually long completions from flooding WeChat.
+- Changes automatic completion attachments to a configurable deliverable-extension allowlist. Documents, spreadsheets, presentations, PDFs, images, archives, and common text deliverables remain eligible; source code, scripts, configuration, logs, and temporary files such as `.js` and `.py` are skipped by default.
+
 ## 0.9.22 - 2026-08-13
 
 - Fails closed when a newly discovered native fork must be replayed from byte zero but its source rollout is unavailable: only the bridge-recorded new turn id may pass, so inherited lifecycle history cannot be published as fresh WeChat notifications. If the rollout appears before `turn/start` returns that id, the monitor holds the cursor at byte zero and retries instead of losing a fast completion.
