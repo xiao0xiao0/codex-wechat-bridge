@@ -1,7 +1,7 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:BridgeVersion = '0.9.30'
+$script:BridgeVersion = '0.9.32'
 $script:DefaultBaseUrl = 'https://ilinkai.weixin.qq.com'
 $script:DefaultCdnBaseUrl = 'https://novac2c.cdn.weixin.qq.com/c2c'
 $script:BotAgent = "CodexWeChatBridge/$($script:BridgeVersion)"
@@ -1564,28 +1564,35 @@ function Set-CodexThreadDisplayName {
 function Get-CodexThreadDisplayName {
     param(
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$SessionId,
-        [string]$Cwd
+        [string]$Cwd,
+        [string]$FallbackName
     )
     $root = Initialize-BridgeState
-    $names = Read-BridgeJson -Path (Join-Path $root 'thread-names.json') -Default @{} -AsHashtable
-    if ($names.ContainsKey($SessionId) -and -not [string]::IsNullOrWhiteSpace([string]$names[$SessionId])) {
-        return [string]$names[$SessionId]
-    }
-
+    # The desktop may rename a task after a bridge notification was sent.
+    # A catalog name for the same immutable id outranks saved bridge aliases;
+    # never use the old notification title to select a different task.
     $catalog = Read-BridgeJson -Path (Join-Path $root 'thread-catalog.json') -Default $null
+    $thread = @()
     if ($catalog -and (Test-BridgeProperty -Object $catalog -Name 'threads')) {
         $thread = @($catalog.threads | Where-Object { [string]$_.session_id -eq $SessionId } | Select-Object -First 1)
         if ($thread.Count -gt 0) {
             $candidate = [string]$thread[0].name
             if (-not [string]::IsNullOrWhiteSpace($candidate)) { return ($candidate -replace '\s+', ' ').Trim() }
-            $candidate = [string]$thread[0].preview
-            if (-not [string]::IsNullOrWhiteSpace($candidate)) {
-                $candidate = ($candidate -replace '\s+', ' ').Trim()
-                if ($candidate.Length -gt 42) { $candidate = $candidate.Substring(0, 42) + '…' }
-                return $candidate
-            }
-            if ([string]::IsNullOrWhiteSpace($Cwd)) { $Cwd = [string]$thread[0].cwd }
         }
+    }
+    $names = Read-BridgeJson -Path (Join-Path $root 'thread-names.json') -Default @{} -AsHashtable
+    if ($names.ContainsKey($SessionId) -and -not [string]::IsNullOrWhiteSpace([string]$names[$SessionId])) {
+        return [string]$names[$SessionId]
+    }
+    if (-not [string]::IsNullOrWhiteSpace($FallbackName)) { return $FallbackName }
+    if ($thread.Count -gt 0) {
+        $candidate = [string]$thread[0].preview
+        if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+            $candidate = ($candidate -replace '\s+', ' ').Trim()
+            if ($candidate.Length -gt 42) { $candidate = $candidate.Substring(0, 42) + '…' }
+            return $candidate
+        }
+        if ([string]::IsNullOrWhiteSpace($Cwd)) { $Cwd = [string]$thread[0].cwd }
     }
     if (-not [string]::IsNullOrWhiteSpace($Cwd)) {
         $leaf = Split-Path -Leaf $Cwd
@@ -2001,7 +2008,9 @@ function Get-CodexRolloutRuntimeIndex {
         $path = [string]$entry.Key
         $tracking = $entry.Value
         if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
-        $sessionId = if ($tracking -and $tracking.ContainsKey('session_id')) {
+        $sessionId = if ([IO.Path]::GetFileNameWithoutExtension($path) -match '_[0-9a-f-]{36}$') {
+            Get-CodexSessionIdFromRolloutPath -Path $path
+        } elseif ($tracking -and $tracking.ContainsKey('session_id')) {
             [string]$tracking.session_id
         } else {
             Get-CodexSessionIdFromRolloutPath -Path $path
@@ -4079,7 +4088,11 @@ function Get-CodexRolloutPath {
     if (-not (Test-Path -LiteralPath $sessionsRoot -PathType Container)) {
         throw "Codex sessions directory was not found: $sessionsRoot"
     }
-    $rollout = Get-ChildItem -LiteralPath $sessionsRoot -Recurse -File -Filter "*-$ThreadId.jsonl" -ErrorAction SilentlyContinue |
+    $ThreadId = $parsedThreadId.ToString()
+    # Compacted/restarted Desktop records can append a second UUID. The file's
+    # session metadata owns the task identity; a filename suffix may be a stream id.
+    $rollout = Get-ChildItem -LiteralPath $sessionsRoot -Recurse -File -Filter "rollout-*$ThreadId*.jsonl" -ErrorAction SilentlyContinue |
+        Where-Object { (Get-CodexSessionIdFromRolloutPath -Path $_.FullName) -eq $ThreadId } |
         Sort-Object LastWriteTime -Descending |
         Select-Object -First 1
     if (-not $rollout) { throw "Codex rollout was not found for task $ThreadId." }
@@ -4209,7 +4222,43 @@ function Get-CodexSessionIdFromRolloutPath {
     $name = [IO.Path]::GetFileNameWithoutExtension($Path)
     $match = [regex]::Match($name, '(?i)([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$')
     if (-not $match.Success) { return $null }
+    $composite = [regex]::Match($name, '(?i)([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})_([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$')
+    if ($composite.Success) {
+        # Do not infer a parent-child relationship from the two UUIDs: a real
+        # fork identifies its child in session_meta; a restarted stream keeps
+        # the original task id there. Missing or conflicting metadata fails closed.
+        try { $metadata = Get-CodexRolloutMetadata -Path $Path } catch { return $null }
+        if (-not $metadata) { return $null }
+        $identity = [guid]::Empty
+        if (-not [guid]::TryParse([string]$metadata.session_id, [ref]$identity)) { return $null }
+        $canonical = $identity.ToString()
+        if ($canonical -notin @($composite.Groups[1].Value, $composite.Groups[2].Value)) { return $null }
+        return $canonical
+    }
     return $match.Groups[1].Value.ToLowerInvariant()
+}
+
+function Resolve-CodexQuotedSessionId {
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$SessionId)
+    $identity = [guid]::Empty
+    if (-not [guid]::TryParse($SessionId, [ref]$identity)) { throw 'Invalid quoted Codex task id.' }
+    $SessionId = $identity.ToString()
+    $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+    $sessionsRoot = Join-Path $codexHome 'sessions'
+    if (-not (Test-Path -LiteralPath $sessionsRoot -PathType Container)) { return $SessionId }
+    $candidates = @(Get-ChildItem -LiteralPath $sessionsRoot -Recurse -File -Filter "rollout-*$SessionId*.jsonl" -ErrorAction SilentlyContinue)
+    $owners = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($file in $candidates) {
+        $owner = Get-CodexSessionIdFromRolloutPath -Path $file.FullName
+        if ([string]::IsNullOrWhiteSpace($owner)) { continue }
+        if ($owner -eq $SessionId) { return $SessionId } # Actual task, including a real fork.
+        if ($file.Name.EndsWith("_$SessionId.jsonl", [StringComparison]::OrdinalIgnoreCase)) {
+            $null = $owners.Add($owner)
+        }
+    }
+    if ($owners.Count -gt 1) { throw 'Quoted Codex task identity is ambiguous; nothing was submitted.' }
+    if ($owners.Count -eq 1) { return @($owners)[0] }
+    return $SessionId
 }
 
 function Get-CodexRolloutMetadata {
@@ -4453,6 +4502,11 @@ function Invoke-CodexRolloutMonitorScan {
             if (-not $pendingRelay) { continue }
         }
         $entry = $state.files[$file.FullName]
+        if ([string]$entry.session_id -ne $sessionId) {
+            # Repair 0.9.30's stream-id tracking without rewinding any byte cursor.
+            $entry.session_id = $sessionId
+            $changed = $true
+        }
         if (-not $entry.ContainsKey('user_visible')) {
             $metadata = Get-CodexRolloutMetadata -Path $file.FullName
             $entry.user_visible = $metadata -and [bool]$metadata.user_visible
@@ -4871,9 +4925,7 @@ function Submit-CodexDesktopPrompt {
     if (-not [guid]::TryParse($ThreadId, [ref]$parsedThreadId)) {
         throw "Invalid Codex task id: $ThreadId"
     }
-    if ([string]::IsNullOrWhiteSpace($ExpectedThreadName)) {
-        $ExpectedThreadName = Get-CodexThreadDisplayName -SessionId $ThreadId
-    }
+    $ExpectedThreadName = Get-CodexThreadDisplayName -SessionId $ThreadId -FallbackName $ExpectedThreadName
     return Submit-CodexDesktopPromptToUri -Uri "codex://threads/$ThreadId" -Prompt $Prompt `
         -ThreadId $ThreadId -ExpectedThreadName $ExpectedThreadName -NavigationDelayMs $NavigationDelayMs
 }
@@ -5077,6 +5129,31 @@ function Invoke-CodexRelayQueueItem {
     $rolloutPath = $null
     try {
         if ($commandType -eq 'continue') {
+            $quotedId = [string]$record.target_session_id
+            $resolvedId = Resolve-CodexQuotedSessionId -SessionId $quotedId
+            if ($resolvedId -ne $quotedId) {
+                $targetName = Get-CodexThreadDisplayName -SessionId $resolvedId -Cwd ([string]$record.target_cwd)
+                $record = Update-InboundRecord -Path $Path -Changes @{
+                    quoted_session_id = $quotedId
+                    target_session_id = $resolvedId
+                    target_thread_name = $targetName
+                    source_session_id = $resolvedId
+                }
+            }
+            # A queued reply can outlive a desktop rename, including while
+            # waiting for a busy task. Re-resolve the name without changing id.
+            $currentName = Get-CodexThreadDisplayName -SessionId $resolvedId `
+                -Cwd ([string]$record.target_cwd) -FallbackName $targetName
+            if ($currentName -cne $targetName) {
+                $record = Update-InboundRecord -Path $Path -Changes @{
+                    previous_target_thread_name = $targetName
+                    target_thread_name = $currentName
+                    target_name_reconciled_at = [DateTimeOffset]::Now.ToString('o')
+                }
+                $targetName = $currentName
+            }
+        }
+        if ($commandType -eq 'continue') {
             $rolloutPath = Get-CodexRolloutPath -ThreadId ([string]$record.target_session_id)
             if (-not (Test-CodexThreadIdle -RolloutPath $rolloutPath)) {
                 Update-InboundRecord -Path $Path -Changes @{
@@ -5238,7 +5315,9 @@ function Invoke-CodexRelayQueueItem {
         } else {
             try {
                 $failedName = if ($targetName) { $targetName } else { 'Codex 对话' }
-                $recovery = if ($commandType -eq 'continue') {
+                $recovery = if ($errorMessage -match '(?i)rollout was not found|sessions directory|task identity is ambiguous') {
+                    '未找到或无法核对引用任务的本地记录。请在 Codex 中确认任务仍存在且未归档；此问题与 Windows 是否锁屏无关。'
+                } elseif ($commandType -eq 'continue') {
                     '本次内容未提交。请保持 Windows 已解锁、Codex 窗口可操作，再重新引用原任务通知；桥接不会启动第二个 App Server 抢占该任务。'
                 } else {
                     '新任务未成功创建；请重新引用原任务的桥接通知后重试。'
@@ -5850,6 +5929,26 @@ function Invoke-BridgeInboundCommand {
         return
     }
 
+    if (-not $unquotedNew -and [string]$execution.command_type -in @('continue', 'fork', 'worktree')) {
+        try {
+            $resolvedId = Resolve-CodexQuotedSessionId -SessionId ([string]$route.session_id)
+            if ($resolvedId -ne [string]$route.session_id) {
+                Update-InboundRecord -Path ([string]$SavedMessage.path) -Changes @{
+                    quoted_session_id = [string]$route.session_id
+                } | Out-Null
+                $route.session_id = $resolvedId
+            }
+            $route.thread_name = Get-CodexThreadDisplayName -SessionId $resolvedId `
+                -Cwd ([string]$route.cwd) -FallbackName ([string]$route.thread_name)
+        } catch {
+            Update-InboundRecord -Path ([string]$SavedMessage.path) -Changes @{
+                relay_state = 'not_executed_identity_unverified'
+                relay_error = $_.Exception.Message
+            } | Out-Null
+            Send-BridgeText -Text '未执行：无法唯一核对引用任务的会话身份，请引用该任务最新的桥接通知后重试。' -TimeoutSeconds 10 | Out-Null
+            return
+        }
+    }
     $newThreadName = if (-not [string]::IsNullOrWhiteSpace([string]$execution.name)) {
         [string]$execution.name
     } elseif ([string]$execution.command_type -in @('new', 'fork', 'worktree')) {

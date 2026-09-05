@@ -1,6 +1,6 @@
 {
   "name": "codex-wechat-bridge",
-  "version": "0.9.30",
+  "version": "0.9.32",
   "description": "Bridge Codex tasks to WeChat with reliable notifications, recoverable backlog reset, quote-authorized continuation, desktop-visible new tasks, branches, and attachments.",
   "author": {
     "name": "Hanxi"
