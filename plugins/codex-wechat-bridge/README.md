@@ -1,6 +1,6 @@
 # Codex WeChat Bridge
 
-Current stable version: **0.9.30**. The bridge validates and self-heals a damaged WeChat polling cursor without replaying accumulated historical commands; transient network failures preserve the last healthy cursor.
+Current stable version: **0.9.32**. Quoted replies follow the current name of the same task, including renames while queued. Session metadata preserves task identity across restart and compaction streams. Cursor self-healing and historical replay protection remain available.
 
 This Windows Codex plugin sends task lifecycle notifications to the official WeChat ClawBot channel and relays controlled commands without installing OpenClaw. Its primary commands continue a quoted task, create a desktop-visible conversation, and create a full-history branch of a quoted conversation.
 

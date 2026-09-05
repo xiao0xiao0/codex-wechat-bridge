@@ -21,3 +21,9 @@ jobs:
       - name: Validate fork replay guard
         shell: pwsh
         run: ./tests/Validate-ForkReplayGuard.ps1
+      - name: Validate rollout task identity
+        shell: pwsh
+        run: ./plugins/codex-wechat-bridge/tests/Test-RolloutIdentity.ps1
+      - name: Validate quoted reply after task rename
+        shell: pwsh
+        run: ./plugins/codex-wechat-bridge/tests/Test-ThreadRename.ps1

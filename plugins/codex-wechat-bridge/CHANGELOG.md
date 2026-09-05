@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.9.32 - 2026-09-05
+
+- Uses the current catalog name for the same task id before stale bridge aliases or quoted notification titles, so desktop renames no longer permanently block continuation.
+- Reconciles names when receiving a quoted command and again when dispatching an already-queued continuation; preserves the original task id and historical quote lookup records.
+- Keeps exact desktop title and composer checks unchanged. Missing catalog names retain the saved or quoted fallback; no title-based task switching or automatic retry of failed prompts is introduced.
+- Adds offline regression coverage for stale names, delayed replies, queued renames, unchanged identity, and the captured real desktop title/composer geometry.
+
+## 0.9.31 - 2026-09-05
+
+- Reads task identity from session metadata for composite `task-id_stream-id.jsonl` records. Completion monitoring and `/状态` no longer invent a task from a restart/compaction stream suffix.
+- Finds the newest record owned by the requested task across ordinary and composite filenames. Real forks remain distinct because their session metadata identifies the child.
+- Resolves old quoted notifications containing a stream id back to their verified task before queuing continuation or a branch. Conflicting identities fail closed; no timestamp or title-based target guessing is introduced.
+- Corrects existing monitor identities in place without resetting byte offsets or replaying historical completions. Missing-record failure notices no longer incorrectly attribute the cause to a locked Windows session.
+
 ## 0.9.30 - 2026-08-21
 
 - Validates the durable WeChat `sync.json` cursor before every poll. Missing, empty, NUL-filled, malformed, or structurally incomplete state now enters a fail-safe self-healing path instead of deadlocking the monitor on a missing property.
