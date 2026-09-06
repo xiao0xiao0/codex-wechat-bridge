@@ -30,7 +30,7 @@ try {
     $module = Get-Module CodexWeChatBridge
     Assert-True ($null -ne $module) 'module must import'
     $version = & $module { $script:BridgeVersion }
-    Assert-Equal $version '0.9.32' 'module version'
+    Assert-Equal $version '0.9.34' 'module version'
 
     $cases = @(
         [pscustomobject]@{ name = 'missing'; bytes = $null; expected_reason = 'missing'; had_file = $false },

@@ -1,6 +1,6 @@
 # Codex WeChat Bridge
 
-Current stable version: **0.9.32**. Quoted replies follow the current name of the same task, including renames while queued. Session metadata preserves task identity across restart and compaction streams. Cursor self-healing and historical replay protection remain available.
+Current version: **0.9.34**. `/回复 ABC234 task text` continues the task bound to a durable six-character reply code; `/回复码` lists codes for recent verified tasks. Codes survive renames, restarts and `/清空`. Exact quotes remain supported, but time/name inference and previously inferred server aliases are no longer accepted. Includes the 0.9.33 bounded notification refresh and recovery improvements.
 
 This Windows Codex plugin sends task lifecycle notifications to the official WeChat ClawBot channel and relays controlled commands without installing OpenClaw. Its primary commands continue a quoted task, create a desktop-visible conversation, and create a full-history branch of a quoted conversation.
 
@@ -9,7 +9,7 @@ This Windows Codex plugin sends task lifecycle notifications to the official WeC
 - WeChat credentials and context tokens are encrypted with Windows DPAPI for the current user.
 - Only the WeChat user who scans the login QR code is accepted.
 - Inbound messages are always stored in a local audit queue.
-- Only the QR-authorized WeChat user can execute messages, and only after the relay is explicitly enabled. Continuation and branch messages must quote a bridge-generated lifecycle notification; `/新建 任务内容` is the explicit unquoted creation exception.
+- Only the QR-authorized WeChat user can execute messages, after enabling the relay. Continuation requires an exact quote or explicit `/回复 CODE text`; `/新建 任务内容` creates a new task without a quote. Branches still require a verified quote. Codes are task selectors, not authentication credentials.
 - Existing-task continuation submits through the Codex desktop composer so the desktop remains the sole writer for that task. It scans all visible Codex windows for up to 30 seconds, selects only the window whose visible task title matches the quoted target, and targets that window's `ProseMirror` input control through Windows UI Automation; if any check fails, nothing is submitted. It requires Windows to be unlocked and the Codex window to be operable, but it cannot create a competing App Server writer.
 - New conversations and branches use the official Codex App Server `thread/start` and `thread/fork` methods. After the first turn is accepted, WeChat receives `开始处理`; the bridge reports success only after that turn finishes and the exact id and name appear in the interactive Codex Desktop task catalog. If the short-lived App Server exits unexpectedly, a durable Chinese paused/failed notification is sent or queued, so the command never remains indefinitely at `等待执行`.
 - Long completion summaries are split at paragraph or sentence boundaries into a bounded series of WeChat messages. Each segment repeats the complete `【已完成】task name` header and a part counter, so quoting any segment remains safe and unambiguous; outbox checkpoints prevent already-sent segments from being replayed after a transient failure.
@@ -40,20 +40,25 @@ After QR confirmation, send any message to ClawBot once. The monitor captures th
 
 ## Controlled two-way relay
 
-Every accepted inbound WeChat message is placed under `inbox/`. After opt-in, only text that quotes a bridge-generated lifecycle notification can continue its named Codex conversation; `/codex <task>` remains as a backward-compatible text form but is subject to the same quote requirement. Existing conversations use the Desktop-owned composer; brand-new conversations use a short-lived official App Server process. The background completion monitor sends results back to WeChat.
+Every accepted inbound WeChat message is placed under `inbox/`. After opt-in, an explicit `/回复 CODE text` or a verified quote can continue a task. `/codex <task>` remains subject to the exact quote requirement. Existing conversations use the Desktop-owned composer; brand-new conversations use a short-lived official App Server process. The background completion monitor sends results back to WeChat.
 
 Execution receipts are distinct: `等待执行` confirms queue admission, `开始处理` is sent only after Codex records `task_started`, and `【已完成】` is emitted from the terminal rollout event.
 
-Long-press the desired `【已完成】...` notification in WeChat, choose quote/reply, and type the continuation normally. Some WeChat clients replace the outbound `client_id`/item `msg_id` with a 19-digit server ID and return no preview text. The bridge first attempts exact ID matching, then derives the referenced send second from the numeric ID's high 32 bits using the current inbound message as a clock calibration and matches it against recorded completion delivery times. A bounded clock-jitter window is accepted only when the nearest conversation has a clear lead; close cross-conversation matches are rejected as ambiguous. This rule is the same whether one or several conversations have finished; ordinary unquoted messages are recorded but never executed.
+Use `/回复 ABC234 continue the task` with the actual code in its notification (ABC234 is only an example). The code binds the immutable task ID, not its title or a delivery time. `/回复码` lists up to 30 recent verified tasks for older notifications without codes. A current catalog name is checked again before desktop submission, including while a reply waits for a busy task. Preserve the entire local state directory, including `reply-codes.json` and its initialization marker, when migrating machines; damaged records fail closed rather than reassigning old codes.
+
+Long-pressing a notification and replying still works when WeChat returns a registered original message ID or the quoted reply-code line. Some clients return only a replacement server ID without original text; those quotes cannot be verified and are rejected with code-command guidance. The bridge never infers the task from a timestamp, numeric-ID clock, title, recent-task selection or an old time-learned alias. Ordinary unquoted messages never execute, even under legacy permissive settings. Conflicting verified quote IDs or an explicit code pointing at another verified quoted task fail closed. Attachment commands need the exact original message ID as well, since a task code alone cannot identify a historical completion round.
 
 Other commands:
 
+- `/回复码` — list durable codes and current task names; does not replay results
+- `/回复 ABC234 task text` — explicitly continue that task without a quote
 - `/桥接状态` — bridge and relay status
 - `/清空` — archive every unsent notification and attachment, advance the completion-monitor watermark, and start delivery from the current moment; no quote required
 - `/状态` — every genuinely running Desktop task, discovered from the live task catalog and verified against its latest rollout lifecycle boundary, including the latest user-visible progress commentary
 - `/状态 最近` — recent conversations by status and name
 - `/状态 完整` — recent conversations with result summaries
 - `/诊断` — monitor, completion watcher, scheduler, Codex, queue, and log diagnosis
+- `/刷新` — actively reconcile latest completions and retry pending text, with connection, recovered/sent/pending counts and a durable result receipt; no quote required
 - quoted `/附件` — attachment counts and numbered files for the referenced completion
 - quoted `/附件 重试` — immediately retry that task's waiting or failed attachments
 - quoted `/附件 <序号>` — enqueue one referenced completion attachment by number
@@ -61,7 +66,9 @@ Other commands:
 - `/在线` — liveness check
 - `/帮助` — command help
 
-Continuation and source-dependent commands must quote a bridge lifecycle notification:
+`/诊断` reports health without initiating repairs. `/刷新` performs delivery work: only the latest terminal event of each task, newer than the saved monitor/clear boundary and retained delivery-ledger horizon, can be recovered. Known sent/suppressed events are never forcibly resent; ambiguous reservations, missing fork baselines, damaged ledgers, or incomplete records are reported and left untouched. Each request has a bounded scan (100 tasks / approximately 15 seconds) and a text batch (up to 6 segments / approximately 25 seconds, subject to an in-flight network call); limits are reported rather than claiming a full reconciliation. Attachments remain on their separate background queue so uploads do not delay the refresh receipt. An offline result receipt is retained for retry without re-executing the command; `/清空` also suppresses old pending refresh receipts. A successful refresh is not a guarantee that every historical completion can be recovered.
+
+Exact quotes remain available for continuation and source-dependent commands:
 
 - quoted text — continue the referenced task
 - `/新建 任务内容` — create an independent desktop-visible conversation; no quote is required, no history is copied, and no project directory is inherited or created
@@ -81,6 +88,7 @@ Completion messages use a compact Chinese layout:
 
 ```text
 【已完成】conversation name
+回复码：ABC234
 result summary
 ```
 

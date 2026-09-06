@@ -1,7 +1,7 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:BridgeVersion = '0.9.32'
+$script:BridgeVersion = '0.9.34'
 $script:DefaultBaseUrl = 'https://ilinkai.weixin.qq.com'
 $script:DefaultCdnBaseUrl = 'https://novac2c.cdn.weixin.qq.com/c2c'
 $script:BotAgent = "CodexWeChatBridge/$($script:BridgeVersion)"
@@ -1699,6 +1699,7 @@ function Register-BridgeReplyTarget {
         [string]$SendStartedAt,
         [string]$SendCompletedAt
     )
+    Get-BridgeNotificationReplyCode -SessionId $SessionId -ThreadName $ThreadName -Cwd $Cwd -TurnId $TurnId | Out-Null
     $createdNew = $false
     $mutex = [System.Threading.Mutex]::new($false, 'Local\CodexWeChatReplyRouting', [ref]$createdNew)
     $locked = $false
@@ -1742,21 +1743,6 @@ function Register-BridgeReplyTarget {
     }
 }
 
-function Find-BridgeThreadRouteByName {
-    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ThreadName)
-    $matches = @(Get-CodexThreadRegistry -Limit 200 | Where-Object {
-        [string]$_.name -eq $ThreadName -or
-        (Get-CodexThreadDisplayName -SessionId ([string]$_.session_id) -Cwd ([string]$_.cwd)) -eq $ThreadName
-    } | Select-Object -First 1)
-    if ($matches.Count -eq 0) { return $null }
-    return [pscustomobject]@{
-        session_id = [string]$matches[0].session_id
-        thread_name = $ThreadName
-        cwd = [string]$matches[0].cwd
-        turn_id = [string]$matches[0].last_turn_id
-    }
-}
-
 function Resolve-BridgeReplyTarget {
     param(
         [string]$ReferenceText,
@@ -1766,228 +1752,7 @@ function Resolve-BridgeReplyTarget {
         [long]$InboundCreateTimeMs,
         [switch]$RequireQuotedReference
     )
-    $createdNew = $false
-    $mutex = [System.Threading.Mutex]::new($false, 'Local\CodexWeChatReplyRouting', [ref]$createdNew)
-    $locked = $false
-    try {
-        try { $locked = $mutex.WaitOne(10000) } catch [System.Threading.AbandonedMutexException] { $locked = $true }
-        if (-not $locked) { throw 'Timed out while resolving WeChat reply routing.' }
-        $state = Get-BridgeReplyRoutingState
-        $pending = @($state.pending_targets)
-        $messageTargets = @($state.message_targets)
-        $target = $null
-        $selection = 'none'
-        foreach ($referenceId in @($ReferenceMessageIds)) {
-            if ([string]::IsNullOrWhiteSpace([string]$referenceId)) { continue }
-            $idMatches = @($messageTargets | Where-Object {
-                [string]$_.wechat_message_id -eq [string]$referenceId
-            } | Select-Object -Last 1)
-            if ($idMatches.Count -gt 0) {
-                $target = $idMatches[0]
-                $selection = 'quoted_id'
-                break
-            }
-        }
-        if (-not $target -and @($ReferenceCreateTimeMs).Count -gt 0) {
-            $explicitTimeMatches = [System.Collections.Generic.List[object]]::new()
-            foreach ($referenceTimeMs in @($ReferenceCreateTimeMs)) {
-                if ([long]$referenceTimeMs -le 0) { continue }
-                $referenceAt = [DateTimeOffset]::FromUnixTimeMilliseconds([long]$referenceTimeMs)
-                foreach ($candidate in $messageTargets) {
-                    $candidateAtText = if ((Test-BridgeProperty -Object $candidate -Name 'send_completed_at') -and
-                        $candidate.send_completed_at) { [string]$candidate.send_completed_at } else { [string]$candidate.notified_at }
-                    $candidateAt = [DateTimeOffset]::MinValue
-                    if (-not [DateTimeOffset]::TryParse($candidateAtText, [ref]$candidateAt)) { continue }
-                    $explicitTimeMatches.Add([pscustomobject]@{
-                        target = $candidate
-                        distance_seconds = [Math]::Abs(($referenceAt - $candidateAt).TotalSeconds)
-                    })
-                }
-            }
-            $explicitBestBySession = @($explicitTimeMatches | Sort-Object distance_seconds |
-                Group-Object { [string]$_.target.session_id } | ForEach-Object { $_.Group[0] } |
-                Sort-Object distance_seconds)
-            $explicitMaxDistanceSeconds = 90.0
-            # ref_msg.message_item.create_time_ms is explicit WeChat quote metadata.
-            # It is commonly rounded to one second, so only near-ties inside the
-            # sub-second precision window should fail closed. A broad margin makes
-            # sequential notifications impossible to quote when several tasks finish together.
-            $explicitAmbiguityMarginSeconds = 0.75
-            if ($explicitBestBySession.Count -gt 0 -and
-                [double]$explicitBestBySession[0].distance_seconds -le $explicitMaxDistanceSeconds) {
-                $explicitAmbiguous = $explicitBestBySession.Count -gt 1 -and
-                    [double]$explicitBestBySession[1].distance_seconds -le $explicitMaxDistanceSeconds -and
-                    ([double]$explicitBestBySession[1].distance_seconds - [double]$explicitBestBySession[0].distance_seconds) -lt $explicitAmbiguityMarginSeconds
-                if ($explicitAmbiguous) {
-                    return [pscustomobject]@{
-                        resolved = $false; ambiguous = $true; pending_count = $pending.Count
-                        names = @($explicitBestBySession | Select-Object -First 6 | ForEach-Object { [string]$_.target.thread_name })
-                        reason = 'quoted_explicit_time_ambiguous'
-                    }
-                }
-                $target = $explicitBestBySession[0].target
-                $selection = 'quoted_explicit_create_time'
-            }
-        }
-        if (-not $target -and $InboundCreateTimeMs -gt 0 -and
-            -not [string]::IsNullOrWhiteSpace($InboundMessageId) -and @($ReferenceMessageIds).Count -gt 0) {
-            $currentNumericId = [UInt64]0
-            if ([UInt64]::TryParse($InboundMessageId, [ref]$currentNumericId)) {
-                $currentHigh = [long]($currentNumericId -shr 32)
-                $inboundAt = [DateTimeOffset]::FromUnixTimeMilliseconds($InboundCreateTimeMs)
-                $timeMatches = [System.Collections.Generic.List[object]]::new()
-                foreach ($referenceId in @($ReferenceMessageIds)) {
-                    $referenceNumericId = [UInt64]0
-                    if (-not [UInt64]::TryParse([string]$referenceId, [ref]$referenceNumericId)) { continue }
-                    $referenceHigh = [long]($referenceNumericId -shr 32)
-                    $estimatedReferenceAt = $inboundAt.AddSeconds($referenceHigh - $currentHigh)
-                    foreach ($candidate in $messageTargets) {
-                        $candidateAtText = if ((Test-BridgeProperty -Object $candidate -Name 'send_completed_at') -and
-                            $candidate.send_completed_at) { [string]$candidate.send_completed_at } else { [string]$candidate.notified_at }
-                        $candidateAt = [DateTimeOffset]::MinValue
-                        if (-not [DateTimeOffset]::TryParse($candidateAtText, [ref]$candidateAt)) { continue }
-                        $distance = [Math]::Abs(($estimatedReferenceAt - $candidateAt).TotalSeconds)
-                        $timeMatches.Add([pscustomobject]@{
-                            target = $candidate
-                            distance_seconds = $distance
-                            estimated_reference_at = $estimatedReferenceAt.ToString('o')
-                        })
-                    }
-                }
-                $bestBySession = @($timeMatches | Sort-Object distance_seconds |
-                    Group-Object { [string]$_.target.session_id } | ForEach-Object { $_.Group[0] } |
-                    Sort-Object distance_seconds)
-                $strictMaxDistanceSeconds = 45.0
-                $strictAmbiguityMarginSeconds = 10.0
-                $extendedMaxDistanceSeconds = 900.0
-                $extendedAmbiguityMarginSeconds = 120.0
-                $multipleCandidateSessions = @($messageTargets | Group-Object { [string]$_.session_id }).Count -gt 1
-                if ($multipleCandidateSessions -and $bestBySession.Count -gt 0) {
-                    return [pscustomobject]@{
-                        resolved = $false
-                        ambiguous = $true
-                        pending_count = $pending.Count
-                        names = @($bestBySession | Select-Object -First 6 | ForEach-Object { [string]$_.target.thread_name })
-                        reason = 'quoted_numeric_unsafe_multiple_candidates'
-                    }
-                }
-                if (-not $multipleCandidateSessions -and $bestBySession.Count -gt 0 -and
-                    [double]$bestBySession[0].distance_seconds -le $extendedMaxDistanceSeconds) {
-                    $usingExtendedMatch = [double]$bestBySession[0].distance_seconds -gt $strictMaxDistanceSeconds
-                    $allowedDistance = if ($usingExtendedMatch) { $extendedMaxDistanceSeconds } else { $strictMaxDistanceSeconds }
-                    $requiredLead = if ($usingExtendedMatch) { $extendedAmbiguityMarginSeconds } else { $strictAmbiguityMarginSeconds }
-                    $isAmbiguousTimeMatch = $bestBySession.Count -gt 1 -and
-                        [double]$bestBySession[1].distance_seconds -le $allowedDistance -and
-                        ([double]$bestBySession[1].distance_seconds - [double]$bestBySession[0].distance_seconds) -lt $requiredLead
-                    if ($isAmbiguousTimeMatch) {
-                        return [pscustomobject]@{
-                            resolved = $false
-                            ambiguous = $true
-                            pending_count = $pending.Count
-                            names = @($bestBySession | Select-Object -First 6 | ForEach-Object { [string]$_.target.thread_name })
-                            reason = 'quoted_server_time_ambiguous'
-                        }
-                    }
-                    $target = $bestBySession[0].target
-                    $selection = if ($usingExtendedMatch) { 'quoted_server_time_extended_unique' } else { 'quoted_server_time' }
-                }
-            }
-        }
-        if (-not $target -and -not [string]::IsNullOrWhiteSpace($ReferenceText)) {
-            $nameMatch = [regex]::Match($ReferenceText, '【(?:已完成|已暂停|执行失败|已创建)】(?<name>[^\r\n]+)')
-            if ($nameMatch.Success) {
-                $quotedName = $nameMatch.Groups['name'].Value.Trim()
-                $quoted = @($pending | Where-Object { [string]$_.thread_name -eq $quotedName } | Select-Object -Last 1)
-                if ($quoted.Count -gt 0) { $target = $quoted[0] }
-                else { $target = Find-BridgeThreadRouteByName -ThreadName $quotedName }
-                if ($target) { $selection = 'quoted' }
-            }
-        }
-        if ($RequireQuotedReference -and -not $target) {
-            return [pscustomobject]@{
-                resolved = $false
-                ambiguous = $false
-                quote_not_found = $true
-                pending_count = $pending.Count
-            }
-        }
-        if (-not $target) {
-            if ($pending.Count -gt 1) {
-                return [pscustomobject]@{
-                    resolved = $false
-                    ambiguous = $true
-                    pending_count = $pending.Count
-                    names = @($pending | ForEach-Object { [string]$_.thread_name })
-                }
-            }
-            if ($pending.Count -eq 1) {
-                $target = $pending[0]
-                $selection = 'single_pending'
-            } elseif ($state.selected_session_id) {
-                $target = [pscustomobject]@{
-                    session_id = [string]$state.selected_session_id
-                    thread_name = [string]$state.selected_thread_name
-                    cwd = [string]$state.selected_cwd
-                    turn_id = $null
-                }
-                $selection = 'selected'
-            } else {
-                $active = Read-BridgeJson -Path (Join-Path (Initialize-BridgeState) 'active-thread.json') -Default $null
-                if ($active -and $active.session_id) {
-                    $target = [pscustomobject]@{
-                        session_id = [string]$active.session_id
-                        thread_name = Get-CodexThreadDisplayName -SessionId ([string]$active.session_id) -Cwd ([string]$active.cwd)
-                        cwd = [string]$active.cwd
-                        turn_id = [string]$active.turn_id
-                    }
-                    $selection = 'active'
-                }
-            }
-        }
-        if (-not $target -or -not $target.session_id) {
-            return [pscustomobject]@{ resolved = $false; ambiguous = $false; pending_count = $pending.Count }
-        }
-        $state.selected_session_id = [string]$target.session_id
-        $state.selected_thread_name = [string]$target.thread_name
-        $state.selected_cwd = [string]$target.cwd
-        $state.selected_at = [DateTimeOffset]::Now.ToString('o')
-        $state.pending_targets = @($pending | Where-Object { [string]$_.session_id -ne [string]$target.session_id })
-        if ($selection -eq 'quoted_explicit_create_time') {
-            foreach ($referenceId in @($ReferenceMessageIds)) {
-                if ([string]::IsNullOrWhiteSpace([string]$referenceId)) { continue }
-                $existingAlias = @($messageTargets | Where-Object {
-                    [string]$_.wechat_message_id -eq [string]$referenceId
-                })
-                if ($existingAlias.Count -gt 0) { continue }
-                $messageTargets += [pscustomobject]@{
-                    session_id = [string]$target.session_id
-                    thread_name = [string]$target.thread_name
-                    cwd = [string]$target.cwd
-                    turn_id = [string]$target.turn_id
-                    wechat_message_id = [string]$referenceId
-                    send_started_at = if (Test-BridgeProperty -Object $target -Name 'send_started_at') { [string]$target.send_started_at } else { $null }
-                    send_completed_at = if (Test-BridgeProperty -Object $target -Name 'send_completed_at') { [string]$target.send_completed_at } else { $null }
-                    notified_at = [DateTimeOffset]::Now.ToString('o')
-                    route_alias = 'wechat_quoted_server_id'
-                }
-            }
-            $state.message_targets = @($messageTargets | Sort-Object { [DateTimeOffset]$_.notified_at } | Select-Object -Last 200)
-        }
-        $state.updated_at = [DateTimeOffset]::Now.ToString('o')
-        Write-BridgeJsonAtomic -Path (Join-Path (Initialize-BridgeState) 'reply-routing.json') -Value $state
-        return [pscustomobject]@{
-            resolved = $true
-            ambiguous = $false
-            selection = $selection
-            session_id = [string]$target.session_id
-            thread_name = [string]$target.thread_name
-            cwd = [string]$target.cwd
-            turn_id = if (Test-BridgeProperty -Object $target -Name 'turn_id') { [string]$target.turn_id } else { '' }
-        }
-    } finally {
-        if ($locked) { try { $mutex.ReleaseMutex() } catch { } }
-        $mutex.Dispose()
-    }
+    return Resolve-BridgeExactReplyTarget -ReferenceText ([string]$ReferenceText) -ReferenceMessageIds $ReferenceMessageIds
 }
 
 function Initialize-CodexThreadRegistryFromActive {
@@ -2357,7 +2122,8 @@ function New-CodexCompletionTextBundle {
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Name,
         [string]$Summary,
         [int]$ChunkChars,
-        [int]$MaxChunks
+        [int]$MaxChunks,
+        [string]$ReplyCode
     )
     $cleanName = ($Name -replace '\s+', ' ').Trim()
     if ([string]::IsNullOrWhiteSpace($Summary)) { $Summary = '本轮处理已经结束，请打开 Codex 查看结果。' }
@@ -2367,6 +2133,7 @@ function New-CodexCompletionTextBundle {
         '文件：$1'
     )
     $header = "【已完成】$cleanName"
+    if ($ReplyCode) { $header += "`n回复码：$ReplyCode" }
     $safeChunkChars = [Math]::Max(400, $(if ($ChunkChars -gt 0) { $ChunkChars } else { 1100 }))
     $safeMaxChunks = [Math]::Min(12, [Math]::Max(1, $(if ($MaxChunks -gt 0) { $MaxChunks } else { 6 })))
     if (($header.Length + 1 + $cleanSummary.Length) -le $safeChunkChars) {
@@ -2503,17 +2270,19 @@ function Get-CodexCompletionAttachments {
 function Publish-CodexTurnNotification {
     param(
         [Parameter(Mandatory)]$HookEvent,
-        [switch]$SuppressNotification
+        [switch]$SuppressNotification,
+        [switch]$QueueOnly
     )
     return Invoke-WithBridgeNotificationGate -Action {
-        Invoke-CodexTurnNotificationCore -HookEvent $HookEvent -SuppressNotification:$SuppressNotification
+        Invoke-CodexTurnNotificationCore -HookEvent $HookEvent -SuppressNotification:$SuppressNotification -QueueOnly:$QueueOnly
     }
 }
 
 function Invoke-CodexTurnNotificationCore {
     param(
         [Parameter(Mandatory)]$HookEvent,
-        [switch]$SuppressNotification
+        [switch]$SuppressNotification,
+        [switch]$QueueOnly
     )
     $root = Initialize-BridgeState
     $displayName = if ((Test-BridgeProperty -Object $HookEvent -Name 'thread_name') -and
@@ -2584,8 +2353,9 @@ function Invoke-CodexTurnNotificationCore {
         $attachmentSummary += '。可引用本通知发送 /附件 查看或重试。'
         $summary = "$attachmentSummary`n`n$summary"
     }
+    $replyCode = Get-BridgeNotificationReplyCode -SessionId $sessionId -ThreadName $displayName -Cwd ([string]$HookEvent.cwd) -TurnId $turnId
     $textBundle = New-CodexCompletionTextBundle -Name $displayName -Summary $summary `
-        -ChunkChars $chunkChars -MaxChunks $maxChunks
+        -ChunkChars $chunkChars -MaxChunks $maxChunks -ReplyCode $replyCode
     $summary = [string]$textBundle.summary
     $textParts = @($textBundle.parts)
     $text = [string]$textParts[0]
@@ -2617,6 +2387,11 @@ function Invoke-CodexTurnNotificationCore {
     }
     $message.attachments = @()
     $message.next_attachment_index = 0
+    if ($QueueOnly) {
+        Queue-BridgeMessage -Message $message
+        Set-CodexNotificationState -SessionId $sessionId -TurnId $turnId -State queued
+        return [pscustomobject]@{ sent = $false; queued = $true }
+    }
     try {
         foreach ($textPart in $textParts) {
             $textDelivery = Send-BridgeRoutableText -Text ([string]$textPart) -AllowContextlessRetry -TimeoutSeconds 15
@@ -2693,7 +2468,9 @@ function Invoke-CodexStateNotificationCore {
         return [pscustomobject]@{ skipped = $true; duplicate = $true }
     }
     $header = if ($State -eq 'paused') { '已暂停' } else { '执行失败' }
-    $text = "【$header】$displayName`n$summary"
+    $replyCode = Get-BridgeNotificationReplyCode -SessionId $sessionId -ThreadName $displayName -Cwd ([string]$HookEvent.cwd) -TurnId $notificationTurnId
+    $codeLine = if ($replyCode) { "回复码：$replyCode`n" } else { '' }
+    $text = "【$header】$displayName`n$codeLine$summary"
     $message = [ordered]@{
         id = [guid]::NewGuid().ToString('N')
         type = 'codex_state'
@@ -4284,6 +4061,7 @@ function Get-CodexRolloutMetadata {
     } else { '' }
     return [pscustomobject]@{
         session_id = $sessionId
+        created_at = if (Test-BridgeProperty -Object $meta -Name 'timestamp') { [string]$meta.timestamp } else { '' }
         cwd = if (Test-BridgeProperty -Object $payload -Name 'cwd') { [string]$payload.cwd } else { '' }
         source = if (Test-BridgeProperty -Object $payload -Name 'source') { [string]$payload.source } else { '' }
         thread_source = $threadSource
@@ -5594,7 +5372,9 @@ Codex 微信双向命令：
 /桥接状态             查看微信桥接器状态
 /诊断                 诊断后台服务、Codex 与队列
 /清空                 归档全部未发送内容，并从当前时刻重新开始
-/刷新                 刷新微信上下文并补发通知
+/刷新                 补查最新完成结果、补发并报告数量（不恢复清空前历史）
+/回复码               查看最近任务的固定回复码
+/回复 回复码 内容      明确续接指定任务，无需引用；改名后回复码不变
 /在线                 检查桥接是否在线
 /帮助                 显示本帮助
 
@@ -5723,6 +5503,13 @@ function Invoke-BridgeInboundCommand {
     $trimmed = $Text.Trim()
     $prefix = [string]$config.relay_command_prefix
 
+    if ($trimmed -in @('/回复码','/codes')) {
+        $reply = Get-BridgeReplyCodesText
+        $delivery = Send-BridgeText -Text $reply -TimeoutSeconds 15
+        Complete-BridgeMaintenanceCommand -SavedMessage $SavedMessage -Command 'reply_codes' -ReplyText $reply -ReplyMessageId ([string]$delivery.message_id)
+        return
+    }
+
     if ($trimmed -in @('/清空', '/clear')) {
         $cleared = Clear-CodexWeChatNotificationBacklog
         $reply = "【已清空】`n已归档未发送通知 $($cleared.text_archived) 条、附件 $($cleared.attachments_archived) 个。`n从现在开始只发送新完成内容。Codex 任务没有停止，本地文件没有删除。"
@@ -5733,11 +5520,7 @@ function Invoke-BridgeInboundCommand {
     }
 
     if ($trimmed -in @('/刷新', '/refresh', '刷新通知', '恢复通知', '补发通知')) {
-        Update-InboundRecord -Path ([string]$SavedMessage.path) -Changes @{
-            relay_state = 'notification_refresh_completed'
-            relay_completed_at = [DateTimeOffset]::Now.ToString('o')
-        } | Out-Null
-        Flush-BridgeOutbox
+        Invoke-BridgeNotificationRefreshCommand -SavedMessage $SavedMessage
         $script:BridgeOutboxFlushedThisPoll = $true
         return
     }
@@ -5758,8 +5541,8 @@ function Invoke-BridgeInboundCommand {
             "正常（积压 $($status.notification_pending_count)）"
         }
         $executionRule = if ([bool]$status.require_completion_quote) {
-            '引用续接和分支已启用；新建无需引用'
-        } else { '允许直接执行' }
+            '支持固定回复码续接；引用需精确核实；新建无需引用'
+        } else { '支持固定回复码或精确引用，不按名称或时间猜测' }
         $resetText = if ($status.notification_reset_at) { "`n最近清空：$($status.notification_reset_at)" } else { '' }
         $reply = "微信桥接在线。`n版本：$script:BridgeVersion`n模式：$modeText`n执行：$executionRule`n通知：$deliveryText$resetText`n待选择对话：$($status.reply_pending_count)`n待执行：$($status.relay_queued_count)`n执行中：$($status.relay_running_count)"
         $delivery = Send-BridgeText -Text $reply -TimeoutSeconds 10
@@ -5826,12 +5609,12 @@ function Invoke-BridgeInboundCommand {
             -ReferenceMessageIds $referenceMessageIds -ReferenceCreateTimeMs $referenceCreateTimeMs `
             -InboundMessageId ([string]$SavedMessage.record.id) -InboundCreateTimeMs ([long]$SavedMessage.record.create_time_ms) `
             -RequireQuotedReference
-        if (-not $attachmentRoute.resolved) {
+        if (-not $attachmentRoute.resolved -or $attachmentRoute.selection -ne 'quoted_id') {
             Update-InboundRecord -Path ([string]$SavedMessage.path) -Changes @{
                 relay_state = 'not_executed_attachment_target_not_found'
                 relay_prompt = $trimmed
             } | Out-Null
-            Send-BridgeText -Text '未执行：没有从引用内容中找到对应的附件任务。请直接引用桥接发送的完整【已完成】通知后重试。' `
+            Send-BridgeText -Text '未执行：无法精确核实这条通知的完成轮次；固定回复码只能定位任务，不能确定旧轮次附件。请引用原通知重试；若客户端仍不提供原消息标识，请到 Codex 获取附件。' `
                 -TimeoutSeconds 10 | Out-Null
             return
         }
@@ -5845,12 +5628,37 @@ function Invoke-BridgeInboundCommand {
     $commandStart = $prefix + ' '
     $explicitCommand = $trimmed.StartsWith($commandStart, [StringComparison]::OrdinalIgnoreCase)
     $prompt = if ($explicitCommand) { $trimmed.Substring($commandStart.Length).Trim() } else { $trimmed }
+    $explicitReplyRoute = $null
+    $isReplyCodeCommand = [regex]::IsMatch($trimmed, '^/(?:回复|reply)(?:\s|$)', 'IgnoreCase')
+    if ($isReplyCodeCommand) {
+        $codeCommand = [regex]::Match($trimmed, '^/(?:回复|reply)\s+([A-HJ-NP-Z2-9]{6})\s+([\s\S]+)$', 'IgnoreCase')
+        if (-not $codeCommand.Success) {
+            Update-InboundRecord -Path ([string]$SavedMessage.path) -Changes @{relay_state='not_executed_invalid_reply_code'} | Out-Null
+            Send-BridgeText -Text '未执行：格式为 /回复 六位回复码 任务内容。发送 /回复码 查看任务列表。' -TimeoutSeconds 10 | Out-Null
+            return
+        }
+        try { $explicitReplyRoute = Resolve-BridgeReplyCode $codeCommand.Groups[1].Value } catch { $explicitReplyRoute = $null }
+        if (-not $explicitReplyRoute -or -not $explicitReplyRoute.resolved) {
+            Update-InboundRecord -Path ([string]$SavedMessage.path) -Changes @{relay_state='not_executed_unknown_reply_code'} | Out-Null
+            Send-BridgeText -Text '未执行：回复码不存在或记录不可核实。请发送 /回复码 查询，不会按名称或时间猜测任务。' -TimeoutSeconds 10 | Out-Null
+            return
+        }
+        if ($hasCompletionQuote) {
+            $quotedRoute = Resolve-BridgeReplyTarget -ReferenceText $referenceText -ReferenceMessageIds $referenceMessageIds -RequireQuotedReference
+            if ($quotedRoute.ambiguous -or ($quotedRoute.resolved -and $quotedRoute.session_id -ne $explicitReplyRoute.session_id)) {
+                Update-InboundRecord -Path ([string]$SavedMessage.path) -Changes @{relay_state='not_executed_conflicting_reply_targets'} | Out-Null
+                Send-BridgeText -Text '未执行：引用与回复码指向不同或冲突的任务，请核对后重发。' -TimeoutSeconds 10 | Out-Null
+                return
+            }
+        }
+        $prompt = $codeCommand.Groups[2].Value.Trim()
+    }
     if ([string]::IsNullOrWhiteSpace($prompt)) {
         Send-BridgeText -Text (Get-BridgeRelayHelpText) -TimeoutSeconds 10 | Out-Null
         return
     }
-    $looksLikeNew = [regex]::IsMatch($prompt, '^/(?:新建|new)(?:\s|$)', 'IgnoreCase')
-    $looksLikeSourceCommand = [regex]::IsMatch($prompt, '^/(?:分支|fork|工作树|worktree)(?:\s|$)', 'IgnoreCase')
+    $looksLikeNew = -not $isReplyCodeCommand -and [regex]::IsMatch($prompt, '^/(?:新建|new)(?:\s|$)', 'IgnoreCase')
+    $looksLikeSourceCommand = -not $isReplyCodeCommand -and [regex]::IsMatch($prompt, '^/(?:分支|fork|工作树|worktree)(?:\s|$)', 'IgnoreCase')
     if ([bool]$config.require_completion_quote -and -not $hasCompletionQuote -and $looksLikeSourceCommand) {
         Update-InboundRecord -Path ([string]$SavedMessage.path) -Changes @{
             relay_state = 'not_executed_unquoted'
@@ -5860,7 +5668,7 @@ function Invoke-BridgeInboundCommand {
             -TimeoutSeconds 10 | Out-Null
         return
     }
-    $execution = Parse-BridgeExecutionCommand -Text $prompt
+    $execution = if ($isReplyCodeCommand) { [pscustomobject]@{valid=$true;command_type='continue';prompt=$prompt;name=''} } else { Parse-BridgeExecutionCommand -Text $prompt }
     if (-not [bool]$execution.valid) {
         Update-InboundRecord -Path ([string]$SavedMessage.path) -Changes @{
             relay_state = 'not_executed_bad_command'
@@ -5872,17 +5680,17 @@ function Invoke-BridgeInboundCommand {
         return
     }
     $unquotedNew = $looksLikeNew -and -not $hasCompletionQuote
-    if ([bool]$config.require_completion_quote -and -not $hasCompletionQuote -and -not $unquotedNew) {
+    if (-not $explicitReplyRoute -and [bool]$config.require_completion_quote -and -not $hasCompletionQuote -and -not $unquotedNew) {
         Update-InboundRecord -Path ([string]$SavedMessage.path) -Changes @{
             relay_state = 'not_executed_unquoted'
             relay_prompt = $trimmed
         } | Out-Null
-        Send-BridgeText -Text '未执行：请引用对应的桥接状态通知，再发送任务内容。普通消息、继续和/分支必须引用；只有/新建可以不引用。' `
+        Send-BridgeText -Text '未执行：普通回复需要精确引用；也可发送 /回复 回复码 任务内容。/新建无需引用。发送 /回复码 查看可用任务。' `
             -TimeoutSeconds 10 | Out-Null
         return
     }
 
-    if (-not $explicitCommand -and -not [bool]$config.direct_reply_enabled -and -not $hasCompletionQuote -and -not $unquotedNew) {
+    if (-not $explicitReplyRoute -and -not $explicitCommand -and -not [bool]$config.direct_reply_enabled -and -not $hasCompletionQuote -and -not $unquotedNew) {
         Send-BridgeText -Text '消息已安全记录，但不会执行。请引用对应的【已完成】通知后再发送。' -TimeoutSeconds 10 | Out-Null
         return
     }
@@ -5891,7 +5699,7 @@ function Invoke-BridgeInboundCommand {
         Send-BridgeText -Text "任务过长；请控制在 $($config.relay_max_input_chars) 个字符以内。" -TimeoutSeconds 10 | Out-Null
         return
     }
-    $route = if ($unquotedNew) {
+    $route = if ($explicitReplyRoute) { $explicitReplyRoute } elseif ($unquotedNew) {
         $defaultTarget = Get-BridgeDefaultNewThreadTarget
         [pscustomobject]@{
             resolved = $true
@@ -5925,7 +5733,7 @@ function Invoke-BridgeInboundCommand {
             relay_prompt = [string]$execution.prompt
             routing_selection = 'quote_target_not_found'
         } | Out-Null
-        Send-BridgeText -Text '未执行：没有从引用内容中找到对应的 Codex 对话。请直接引用桥接发送的完整【已完成】通知后重试。' -TimeoutSeconds 10 | Out-Null
+        Send-BridgeText -Text '未执行：微信引用未提供可核实的任务标识。请发送 /回复 回复码 任务内容；回复码可从通知或 /回复码 查询。' -TimeoutSeconds 10 | Out-Null
         return
     }
 
@@ -6144,8 +5952,9 @@ function Compact-BridgeOutbox {
         $config = Get-BridgeConfig
         $chunkChars = if ($config.completion_text_chunk_chars) { [int]$config.completion_text_chunk_chars } else { 1100 }
         $maxChunks = if ($config.completion_text_max_chunks) { [int]$config.completion_text_max_chunks } else { 6 }
+        $replyCode = Get-BridgeNotificationReplyCode -SessionId $sessionId -ThreadName $name -Cwd ([string]$latest.message.cwd) -TurnId ([string]$latest.message.turn_id)
         $textBundle = New-CodexCompletionTextBundle -Name $name -Summary $summary `
-            -ChunkChars $chunkChars -MaxChunks $maxChunks
+            -ChunkChars $chunkChars -MaxChunks $maxChunks -ReplyCode $replyCode
         $summary = [string]$textBundle.summary
         $latest.message.text = [string]$textBundle.parts[0]
         if (Test-BridgeProperty -Object $latest.message -Name 'thread_name') { $latest.message.thread_name = $name }
@@ -6191,10 +6000,17 @@ function Compact-BridgeOutbox {
 }
 
 function Flush-BridgeOutbox {
-    return Invoke-WithBridgeNotificationGate -Action { Invoke-BridgeOutboxFlushCore }
+    param([switch]$PassThru, [switch]$SkipAttachments, [int]$TextPartLimit = 0, [int]$BudgetSeconds = 0)
+    return Invoke-WithBridgeNotificationGate -Action {
+        Invoke-BridgeOutboxFlushCore -PassThru:$PassThru -SkipAttachments:$SkipAttachments `
+            -TextPartLimit $TextPartLimit -BudgetSeconds $BudgetSeconds
+    }
 }
 
 function Invoke-BridgeOutboxFlushCore {
+    param([switch]$PassThru, [switch]$SkipAttachments, [int]$TextPartLimit = 0, [int]$BudgetSeconds = 0)
+    $stats = [pscustomobject]@{ notifications_sent = 0; text_parts_sent = 0; send_failures = 0; budget_exhausted = $false }
+    $deadline = if ($BudgetSeconds -gt 0) { [DateTimeOffset]::Now.AddSeconds($BudgetSeconds) } else { [DateTimeOffset]::MaxValue }
     $root = Initialize-BridgeState
     Move-BridgeQueuedRecordsAtOrBeforeReset -Queue 'all' | Out-Null
     Move-LegacyBridgeAttachmentsToQueue | Out-Null
@@ -6205,7 +6021,7 @@ function Invoke-BridgeOutboxFlushCore {
     Compact-BridgeOutbox
     $delivery = Get-BridgeDeliveryState
     if ([string]$delivery.state -eq 'waiting_for_wechat' -and
-        -not (Test-BridgeDeliveryRetryDue -DeliveryState $delivery)) { return }
+        -not (Test-BridgeDeliveryRetryDue -DeliveryState $delivery)) { if ($PassThru) { return $stats }; return }
     $config = Get-BridgeConfig
     $batchSize = [Math]::Max(1, [int]$config.outbox_send_batch_size)
     $outboxPath = Join-Path $root 'outbox'
@@ -6220,6 +6036,7 @@ function Invoke-BridgeOutboxFlushCore {
     # Pass 1: deliver every completion/state text before trying any attachment.
     # A large or rejected attachment must never block later task notifications.
     foreach ($file in $files) {
+        if ([DateTimeOffset]::Now -ge $deadline -or ($TextPartLimit -gt 0 -and $stats.text_parts_sent -ge $TextPartLimit)) { $stats.budget_exhausted = $true; break }
         $message = Read-BridgeJson -Path $file.FullName -Default $null
         if (-not $message -or (-not $message.text -and -not $message.text_parts)) { continue }
         $textSent = (Test-BridgeProperty -Object $message -Name 'text_sent') -and [bool]$message.text_sent
@@ -6235,9 +6052,11 @@ function Invoke-BridgeOutboxFlushCore {
                 $message | Add-Member -NotePropertyName wechat_message_ids -NotePropertyValue @()
             }
             while ($nextTextIndex -lt $textParts.Count) {
+                if ([DateTimeOffset]::Now -ge $deadline -or ($TextPartLimit -gt 0 -and $stats.text_parts_sent -ge $TextPartLimit)) { $stats.budget_exhausted = $true; break }
                 $textDelivery = Send-BridgeRoutableText -Text ([string]$textParts[$nextTextIndex]) `
                     -AllowContextlessRetry -TimeoutSeconds 15
                 $nextTextIndex++
+                $stats.text_parts_sent++
                 if (Test-BridgeProperty -Object $message -Name 'next_text_index') {
                     $message.next_text_index = $nextTextIndex
                 } else {
@@ -6257,6 +6076,7 @@ function Invoke-BridgeOutboxFlushCore {
                 # from the next part instead of replaying the beginning.
                 Write-BridgeJsonAtomic -Path $file.FullName -Value $message
             }
+            if ($nextTextIndex -lt $textParts.Count) { continue }
             if (Test-BridgeProperty -Object $message -Name 'text_sent') { $message.text_sent = $true }
             else { $message | Add-Member -NotePropertyName text_sent -NotePropertyValue $true }
             Write-BridgeJsonAtomic -Path $file.FullName -Value $message
@@ -6264,6 +6084,7 @@ function Invoke-BridgeOutboxFlushCore {
                 Set-CodexNotificationState -SessionId ([string]$message.session_id) `
                     -TurnId ([string]$message.turn_id) -State sent
             }
+            $stats.notifications_sent++
             $messageAttachments = @(if ((Test-BridgeProperty -Object $message -Name 'attachments') -and $null -ne $message.attachments) {
                 @($message.attachments)
             } else { @() })
@@ -6271,6 +6092,7 @@ function Invoke-BridgeOutboxFlushCore {
                 Remove-Item -LiteralPath $file.FullName -Force
             }
         } catch {
+            $stats.send_failures++
             $delivery = Get-BridgeDeliveryState
             if ([string]$delivery.state -ne 'waiting_for_wechat') {
                 Write-BridgeLog -Level WARN -Message "Outbox text delivery deferred: $($_.Exception.Message)"
@@ -6280,10 +6102,11 @@ function Invoke-BridgeOutboxFlushCore {
     }
 
     $delivery = Get-BridgeDeliveryState
-    if ([string]$delivery.state -eq 'waiting_for_wechat') { return }
+    if ([string]$delivery.state -eq 'waiting_for_wechat' -or $SkipAttachments) { if ($PassThru) { return $stats }; return }
 
     Flush-BridgeAttachmentOutbox | Out-Null
     Publish-BridgeCompletedAttachmentSummaries
+    if ($PassThru) { return $stats }
 }
 
 function Invoke-BridgePollOnce {
@@ -6351,6 +6174,7 @@ function Invoke-BridgePollOnce {
         Invoke-BridgeInboundCommand -Text $text -SavedMessage $savedMessage
     }
     if (-not $script:BridgeOutboxFlushedThisPoll) { Flush-BridgeOutbox }
+    Flush-BridgeRefreshReceipts
     return $response
 }
 
@@ -6552,6 +6376,9 @@ function Get-BridgeDoctorText {
     if (-not $monitorAlive -or -not $completionAlive) { $lines += '建议：重新运行 Install-WeChatBridgeService.ps1 -StartNow。' }
     return $lines -join "`n"
 }
+
+. (Join-Path $PSScriptRoot 'BridgeNotificationRefresh.ps1')
+. (Join-Path $PSScriptRoot 'BridgeReplyCodes.ps1')
 
 Export-ModuleMember -Function @(
     'Clear-CodexWeChatNotificationBacklog',

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.9.34 - 2026-09-06
+
+- Adds durable six-character task reply codes and explicit `/回复 CODE text` continuation; `/回复码` discovers codes for up to 30 recent verified tasks. Bindings use immutable task IDs and survive title changes, restarts, delayed replies and backlog clears.
+- Removes time, title, numeric-ID clock and selected-task routing fallbacks. Rejects legacy server aliases learned by time inference, conflicting verified selectors, unknown codes and corrupt/missing initialized ledgers; ordinary unquoted messages never execute.
+- Repeats the reply code in each completion segment and lifecycle notification. Names are refreshed from the current task catalog at admission and again at dispatch; queued continuations remain exactly-once and desktop-owned.
+- Preserves notification delivery when the optional code ledger is unavailable. Quote-only attachment recovery requires the original message ID to verify the completion round, not merely its task code.
+- Includes 0.9.33 notification refresh recovery. Adds anonymous isolated reply-code regression coverage; no live credentials, messages or desktop task submissions are needed by the test suite.
+
+## 0.9.33 - 2026-09-06
+
+- Makes `/刷新` an explicit reconciliation action with an immediate acknowledgement and a durable Chinese result receipt showing connection, recovered notifications, successful text deliveries, and remaining text/attachment counts. `/诊断` remains a health report.
+- Recovers only each task's latest eligible completion after the monitor/reset/retained-ledger boundary. Existing sent, suppressed, queued or ambiguous reserved keys are not replayed; incomplete records and unverified fork ancestry fail closed. The live monitor offsets are never reset.
+- Adds queue-only publishing and bounded, checkpointed text flush statistics. Refresh does not wait for attachment uploads; existing background attachment delivery, filters and retry commands remain unchanged.
+- Retries undelivered refresh receipts without rerunning commands and respects subsequent `/清空` watermarks. Adds isolated offline coverage for recovery, deduplication, clear boundaries, fork history, bounded part delivery and receipt recovery.
+
 ## 0.9.32 - 2026-09-05
 
 - Uses the current catalog name for the same task id before stale bridge aliases or quoted notification titles, so desktop renames no longer permanently block continuation.
