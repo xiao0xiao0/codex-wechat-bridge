@@ -27,3 +27,9 @@ jobs:
       - name: Validate quoted reply after task rename
         shell: pwsh
         run: ./plugins/codex-wechat-bridge/tests/Test-ThreadRename.ps1
+      - name: Validate bounded notification refresh
+        shell: pwsh
+        run: ./plugins/codex-wechat-bridge/tests/Test-NotificationRefresh.ps1
+      - name: Validate durable reply codes and exact targeting
+        shell: pwsh
+        run: ./plugins/codex-wechat-bridge/tests/Test-ReplyCodes.ps1

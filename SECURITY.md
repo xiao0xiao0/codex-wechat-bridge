@@ -9,6 +9,7 @@ Security fixes are applied to the latest published version only.
 - Runtime credentials, WeChat identifiers, queues, logs and routing state are created only under `%LOCALAPPDATA%\CodexWeChatBridge` unless the user overrides `CODEX_WECHAT_BRIDGE_HOME`.
 - Credentials are encrypted with Windows DPAPI for the current Windows user.
 - These runtime files must never be committed to the repository or included in support bundles.
+- Reply codes select immutable tasks; they are not credentials and never bypass the paired-user or enabled-relay checks. Preserve `reply-codes.json` and its initialization marker privately when migrating state. Unknown, corrupt, conflicting or unverifiable selectors fail closed; inferred time/name routes and time-learned aliases are not accepted.
 - Completion attachments are disabled by default. Enabling them uploads selected local files to Tencent's WeChat CDN.
 
 ## Reporting a vulnerability

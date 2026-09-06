@@ -13,7 +13,7 @@ foreach ($path in @($manifestPath, $marketplacePath, (Join-Path $repoRoot 'READM
 
 $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding utf8 | ConvertFrom-Json
 if ([string]$manifest.name -ne 'codex-wechat-bridge') { throw 'Unexpected plugin name.' }
-if ([string]$manifest.version -ne '0.9.32') { throw "Unexpected plugin version: $($manifest.version)" }
+if ([string]$manifest.version -ne '0.9.34') { throw "Unexpected plugin version: $($manifest.version)" }
 
 $releaseNotesPath = Join-Path $repoRoot ("docs\releases\v{0}.md" -f [string]$manifest.version)
 if (-not (Test-Path -LiteralPath $releaseNotesPath -PathType Leaf)) {
@@ -67,6 +67,7 @@ $releaseFiles = @(Get-ChildItem -LiteralPath $repoRoot -Recurse -File -Force | W
     ($_.Extension -in $textExtensions -or $_.Name -eq '.gitignore')
 })
 foreach ($file in $releaseFiles) {
+    if ($file.Name -in @('AGENTS.md','MAINTENANCE.local.md','reply-codes.json','reply-codes.initialized.json') -or $file.FullName -match '[\\/](?:inbox|outbox|logs|cleared|attachment-outbox)[\\/]') { throw "Private maintenance/runtime file in public release: $($file.Name)" }
     $content = Get-Content -LiteralPath $file.FullName -Raw -Encoding utf8
     foreach ($pattern in $forbiddenPatterns.GetEnumerator()) {
         if ($content -match $pattern.Value) { throw "Forbidden $($pattern.Key) found in $($file.FullName)." }
